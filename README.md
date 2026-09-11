@@ -11,7 +11,7 @@
 
 orcis is a JSON-over-HTTP task board built exclusively for AI agents. It exposes an unordered pool of tasks with priorities, freeform capability requirements (`requires`), dependency edges (`depends_on`), and an atomic operation that gives an agent the best ready task it can perform.
 
-Run it as a single static binary configured through environment variables. Keep state in memory or persist the entire board to a file, and optionally protect the API with a bearer token. There is no UI and no database by design.
+Run it as a single static binary configured through environment variables, and optionally protect the API with a bearer token. State lives in an embedded SQLite database (one file, no server to run), and there is no UI by design.
 
 ## Features
 
@@ -20,8 +20,8 @@ Run it as a single static binary configured through environment variables. Keep 
 - Filter tasks by status, readiness, requirements, and claiming agent.
 - Enforce task-state transitions and ownership of active work.
 - Attach arbitrary JSON metadata and completion or failure results.
-- Persist the board to one JSON file after every mutation.
-- Run without persistence or authentication for local coordination.
+- Persist the board in a single SQLite file with WAL and transactional claims.
+- Run with an in-memory database and no authentication for local coordination.
 - Discover every route through the JSON index at `GET /`.
 
 ## How it works
@@ -62,17 +62,16 @@ cargo run
 
 ### Run the container
 
-Run the published image with in-memory state:
+Run the published image with throwaway state. The database is written inside the container and discarded with it:
 
 ```bash
 docker run --rm -p 8080:8080 ghcr.io/nsg/orcis:latest
 ```
 
-Persist the board in a named volume:
+Persist the board in a named volume. The container already defaults to `ORCIS_DB_PATH=/data/orcis.db`, so only the volume mount is needed:
 
 ```bash
 docker run --rm -p 8080:8080 \
-  -e ORCIS_DATA_PATH=/data/orcis.json \
   -v orcis-data:/data \
   ghcr.io/nsg/orcis:latest
 ```
@@ -133,11 +132,11 @@ blocked.
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `ORCIS_ADDR` | `127.0.0.1:8080` | Socket address on which to listen. The container overrides this with `0.0.0.0:8080`. |
-| `ORCIS_DATA_PATH` | unset | JSON file to load at startup and update after mutations. Keep the board in memory when unset. |
+| `ORCIS_DB_PATH` | `orcis.db` | SQLite database file; created on first start. `:memory:` keeps the board in memory. |
 | `ORCIS_TOKEN` | unset | Expected bearer token. Disable authentication when unset. |
 | `RUST_LOG` | `info` | `tracing-subscriber` environment-filter directive. |
 
-When `ORCIS_DATA_PATH` is set, orcis writes the whole board after every successful mutation using `<path>.tmp` followed by a rename. It creates missing parent directories. If a write fails, it rolls back the in-memory mutation and returns `500 Internal Server Error`. A missing file starts an empty board; an unreadable, corrupt, or invalid dependency graph stops startup. When the variable is unset, state exists only in memory.
+Every mutation is one SQLite transaction (`BEGIN IMMEDIATE`). The database uses WAL journal mode, and its schema is created and migrated automatically with `PRAGMA user_version`. Failure to open the database stops startup. A failed write returns `500 Internal Server Error` and leaves the board unchanged.
 
 When `ORCIS_TOKEN` is set, send `Authorization: Bearer …` on every request except `GET /healthz`. This includes the discovery index and other methods on `/healthz`.
 
@@ -295,11 +294,13 @@ Every API error is JSON with one field:
 | `409 Conflict` | A transition, ownership, readiness, deletion, or dependency-cycle rule is violated. |
 | `413 Payload Too Large` | A JSON request exceeds axum's 2 MiB default body limit. |
 | `415 Unsupported Media Type` | A required or present JSON body does not have a JSON content type. |
-| `500 Internal Server Error` | Persisting a mutation fails. The in-memory mutation is rolled back. |
+| `500 Internal Server Error` | A database operation fails. The transaction is rolled back. |
 
 Responses use `Content-Type: application/json` except successful `204 No Content` responses.
 
 ## Development
+
+SQLite is compiled in through `rusqlite`'s `bundled` feature, so a C compiler is needed to build orcis.
 
 Run the local checks:
 

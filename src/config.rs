@@ -1,9 +1,9 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub addr: SocketAddr,
-    pub data_path: Option<PathBuf>,
+    pub db_path: String,
     pub token: Option<String>,
     pub rust_log: String,
 }
@@ -25,7 +25,7 @@ impl Config {
 
         Ok(Self {
             addr,
-            data_path: get("ORCIS_DATA_PATH").map(PathBuf::from),
+            db_path: get("ORCIS_DB_PATH").unwrap_or_else(|| "orcis.db".to_owned()),
             token: get("ORCIS_TOKEN"),
             rust_log: get("RUST_LOG").unwrap_or_else(|| "info".to_owned()),
         })
@@ -40,17 +40,18 @@ mod tests {
     fn defaults_and_overrides() {
         let config = Config::from_map(&HashMap::new()).expect("defaults are valid");
         assert_eq!(config.addr, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(config.db_path, "orcis.db");
         assert_eq!(config.rust_log, "info");
 
         let values = HashMap::from([
             ("ORCIS_ADDR".to_owned(), "0.0.0.0:9000".to_owned()),
-            ("ORCIS_DATA_PATH".to_owned(), "/tmp/orcis.json".to_owned()),
+            ("ORCIS_DB_PATH".to_owned(), "/tmp/orcis.db".to_owned()),
             ("ORCIS_TOKEN".to_owned(), "secret".to_owned()),
             ("RUST_LOG".to_owned(), "debug".to_owned()),
         ]);
         let config = Config::from_map(&values).expect("overrides are valid");
         assert_eq!(config.addr, "0.0.0.0:9000".parse().unwrap());
-        assert_eq!(config.data_path, Some(PathBuf::from("/tmp/orcis.json")));
+        assert_eq!(config.db_path, "/tmp/orcis.db");
         assert_eq!(config.token.as_deref(), Some("secret"));
         assert_eq!(config.rust_log, "debug");
     }

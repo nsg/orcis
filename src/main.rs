@@ -29,13 +29,8 @@ async fn run() -> Result<(), String> {
         .with_env_filter(filter)
         .init();
 
-    let store = Store::load(config.data_path.clone()).map_err(|error| {
-        let path = config
-            .data_path
-            .as_ref()
-            .map_or_else(|| "<memory>".to_owned(), |path| path.display().to_string());
-        format!("failed to load ORCIS_DATA_PATH {path:?}: {error}")
-    })?;
+    let store = Store::open(&config.db_path)
+        .map_err(|error| format!("failed to open ORCIS_DB_PATH {:?}: {error}", config.db_path))?;
     let app = router(AppState::new(store, config.token));
     let listener = TcpListener::bind(config.addr)
         .await
@@ -43,7 +38,7 @@ async fn run() -> Result<(), String> {
     let bound = listener
         .local_addr()
         .map_err(|error| format!("failed to inspect bound address: {error}"))?;
-    info!(address = %bound, "orcis listening");
+    info!(address = %bound, database = %config.db_path, "orcis listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

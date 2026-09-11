@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 fn app(token: Option<&str>) -> Router {
-    router(AppState::new(Store::new(None), token.map(str::to_owned)))
+    router(AppState::new(Store::in_memory(), token.map(str::to_owned)))
 }
 
 fn get(path: &str) -> Request<Body> {

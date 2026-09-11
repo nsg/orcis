@@ -130,7 +130,7 @@ impl From<StoreError> for ApiError {
                 error!(%message, "internal store error");
                 Self {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message,
+                    message: "internal error".to_owned(),
                 }
             }
             StoreError::Invalid(message) => Self::bad_request(message),
@@ -276,7 +276,7 @@ async fn list_tasks(
 ) -> Result<AxumJson<TaskList>, ApiError> {
     let filters = Filters::parse(parameters)?;
     let tasks = lock(&state)
-        .list()
+        .list()?
         .into_iter()
         .filter(|task| filters.matches(task))
         .collect();

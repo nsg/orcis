@@ -1,3 +1,5 @@
 /target
 /.claude-sandbox
-*.json.tmp
+*.db
+*.db-wal
+*.db-shm

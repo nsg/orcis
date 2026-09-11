@@ -13,7 +13,7 @@ pub enum Status {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Task {
     pub id: Uuid,
     pub title: String,

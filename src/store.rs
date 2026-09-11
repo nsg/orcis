@@ -1,17 +1,38 @@
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, HashSet},
-    fs,
-    io::{self, ErrorKind},
-    path::PathBuf,
-};
+use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
-use serde::{Deserialize, Serialize};
+use rusqlite::{
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, types::Type,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{CreateTask, Patch, PatchTask, Status, Task, TaskView};
+
+const MIGRATIONS: &[&str] = &[r#"
+CREATE TABLE tasks (
+  id          TEXT PRIMARY KEY,
+  title       TEXT NOT NULL,
+  description TEXT NOT NULL,
+  status      TEXT NOT NULL,
+  priority    INTEGER NOT NULL,
+  requires    TEXT NOT NULL,
+  metadata    TEXT NOT NULL,
+  claimed_by  TEXT,
+  result      TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  version     INTEGER NOT NULL
+);
+CREATE TABLE task_dependencies (
+  task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+  depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+  position   INTEGER NOT NULL,
+  PRIMARY KEY (task_id, depends_on)
+);
+CREATE INDEX task_dependencies_depends_on ON task_dependencies(depends_on);
+CREATE INDEX tasks_status_priority ON tasks(status, priority DESC, created_at, id);
+"#];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoreError {
@@ -21,10 +42,15 @@ pub enum StoreError {
     Internal(String),
 }
 
+impl From<rusqlite::Error> for StoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Internal(error.to_string())
+    }
+}
+
 #[derive(Debug)]
 pub struct Store {
-    tasks: BTreeMap<Uuid, Task>,
-    path: Option<PathBuf>,
+    conn: Connection,
 }
 
 #[derive(Clone, Copy)]
@@ -34,60 +60,27 @@ enum OwnedAction {
     Fail,
 }
 
-#[derive(Deserialize, Serialize)]
-struct PersistedBoard {
-    tasks: BTreeMap<Uuid, Task>,
-}
-
 impl Store {
-    pub fn new(path: Option<PathBuf>) -> Self {
-        Self {
-            tasks: BTreeMap::new(),
-            path,
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let mut conn = if path == ":memory:" {
+            Connection::open_in_memory()?
+        } else {
+            Connection::open(path)?
+        };
+        if path != ":memory:" {
+            conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         }
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        migrate(&mut conn)?;
+        Ok(Self { conn })
     }
 
-    pub fn load(path: Option<PathBuf>) -> io::Result<Self> {
-        let Some(board_path) = path else {
-            return Ok(Self::new(None));
-        };
-
-        let bytes = match fs::read(&board_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(Self::new(Some(board_path)));
-            }
-            Err(error) => return Err(error),
-        };
-        let board: PersistedBoard = serde_json::from_slice(&bytes)
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-        let store = Self {
-            tasks: board.tasks,
-            path: Some(board_path),
-        };
-        store.validate_loaded_graph()?;
-        Ok(store)
-    }
-
-    pub fn save(&self) -> io::Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        let mut temporary = path.as_os_str().to_os_string();
-        temporary.push(".tmp");
-        let temporary = PathBuf::from(temporary);
-        let bytes = serde_json::to_vec_pretty(&PersistedBoard {
-            tasks: self.tasks.clone(),
-        })
-        .map_err(io::Error::other)?;
-        fs::write(&temporary, bytes)?;
-        fs::rename(temporary, path)
+    pub fn in_memory() -> Self {
+        Self::open(":memory:").expect("in-memory SQLite database opens")
     }
 
     pub fn create(&mut self, request: CreateTask) -> Result<TaskView, StoreError> {
@@ -100,133 +93,130 @@ impl Store {
         request: CreateTask,
         now: Timestamp,
     ) -> Result<TaskView, StoreError> {
-        self.commit(move |store| {
-            validate_title(&request.title)?;
-            let depends_on = deduplicate(request.depends_on);
-            store.validate_dependencies(id, &depends_on)?;
-            store.validate_cycle(id, &depends_on)?;
-            let task = Task {
-                id,
-                title: request.title,
-                description: request.description,
-                status: Status::Todo,
-                priority: request.priority,
-                requires: deduplicate(request.requires),
-                depends_on,
-                metadata: request.metadata,
-                claimed_by: None,
-                result: None,
-                created_at: now,
-                updated_at: now,
-                version: 1,
-            };
-            store.tasks.insert(id, task);
-            store.get(id)
-        })
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_title(&request.title)?;
+        let requires = deduplicate(request.requires);
+        let depends_on = deduplicate(request.depends_on);
+        validate_dependencies(&tx, id, &depends_on)?;
+        validate_cycle(&tx, id, &depends_on)?;
+
+        let task = Task {
+            id,
+            title: request.title,
+            description: request.description,
+            status: Status::Todo,
+            priority: request.priority,
+            requires,
+            depends_on,
+            metadata: request.metadata,
+            claimed_by: None,
+            result: None,
+            created_at: now,
+            updated_at: now,
+            version: 1,
+        };
+        insert_task(&tx, &task)?;
+        replace_dependencies(&tx, task.id, &task.depends_on)?;
+        let view = view(&tx, task)?;
+        tx.commit()?;
+        Ok(view)
     }
 
     pub fn get(&self, id: Uuid) -> Result<TaskView, StoreError> {
-        let task = self.tasks.get(&id).ok_or(StoreError::NotFound)?;
-        Ok(self.view(task))
+        let tx = self.conn.unchecked_transaction()?;
+        let task = read_task(&tx, id)?;
+        let view = view(&tx, task)?;
+        tx.commit()?;
+        Ok(view)
     }
 
-    pub fn list(&self) -> Vec<TaskView> {
-        let mut tasks: Vec<_> = self.tasks.values().map(|task| self.view(task)).collect();
-        tasks.sort_by(|left, right| {
-            right
-                .task
-                .priority
-                .cmp(&left.task.priority)
-                .then_with(|| left.task.created_at.cmp(&right.task.created_at))
-                .then_with(|| left.task.id.cmp(&right.task.id))
-        });
-        tasks
+    pub fn list(&self) -> Result<Vec<TaskView>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let views = list_views(&tx)?;
+        tx.commit()?;
+        Ok(views)
     }
 
     pub fn patch(&mut self, id: Uuid, patch: PatchTask) -> Result<TaskView, StoreError> {
-        self.commit(move |store| {
-            if !store.tasks.contains_key(&id) {
-                return Err(StoreError::NotFound);
-            }
-            let PatchTask {
-                title,
-                description,
-                priority,
-                requires,
-                depends_on,
-                metadata,
-            } = patch;
-            if let Patch::Present(title) = &title {
-                validate_title(title)?;
-            }
-            let requires = map_patch(requires, deduplicate);
-            let depends_on = map_patch(depends_on, deduplicate);
-            if let Patch::Present(dependencies) = &depends_on {
-                store.validate_dependencies(id, dependencies)?;
-                store.validate_cycle(id, dependencies)?;
-            }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut task = read_task(&tx, id)?;
+        let PatchTask {
+            title,
+            description,
+            priority,
+            requires,
+            depends_on,
+            metadata,
+        } = patch;
 
-            let task = store.tasks.get_mut(&id).expect("existence checked above");
-            if let Patch::Present(title) = title {
-                task.title = title;
-            }
-            if let Patch::Present(description) = description {
-                task.description = description;
-            }
-            if let Patch::Present(priority) = priority {
-                task.priority = priority;
-            }
-            if let Patch::Present(requires) = requires {
-                task.requires = requires;
-            }
-            if let Patch::Present(depends_on) = depends_on {
-                task.depends_on = depends_on;
-            }
-            if let Patch::Present(metadata) = metadata {
-                task.metadata = metadata;
-            }
-            touch(task);
-            store.get(id)
-        })
+        if let Patch::Present(title) = &title {
+            validate_title(title)?;
+        }
+        if let Patch::Present(dependencies) = depends_on {
+            let dependencies = deduplicate(dependencies);
+            tx.execute(
+                "DELETE FROM task_dependencies WHERE task_id = ?1",
+                [id.to_string()],
+            )?;
+            validate_dependencies(&tx, id, &dependencies)?;
+            validate_cycle(&tx, id, &dependencies)?;
+            replace_dependencies(&tx, id, &dependencies)?;
+            task.depends_on = dependencies;
+        }
+        if let Patch::Present(title) = title {
+            task.title = title;
+        }
+        if let Patch::Present(description) = description {
+            task.description = description;
+        }
+        if let Patch::Present(priority) = priority {
+            task.priority = priority;
+        }
+        if let Patch::Present(requires) = requires {
+            task.requires = deduplicate(requires);
+        }
+        if let Patch::Present(metadata) = metadata {
+            task.metadata = metadata;
+        }
+        touch(&mut task);
+        update_task(&tx, &task)?;
+        let view = view(&tx, task)?;
+        tx.commit()?;
+        Ok(view)
     }
 
     pub fn delete(&mut self, id: Uuid) -> Result<(), StoreError> {
-        self.commit(|store| {
-            if !store.tasks.contains_key(&id) {
-                return Err(StoreError::NotFound);
-            }
-            let dependents = store.dependent_ids(id);
-            if !dependents.is_empty() {
-                return Err(StoreError::Conflict(format!(
-                    "task has dependents: {}",
-                    join_ids(&dependents)
-                )));
-            }
-            store.tasks.remove(&id);
-            Ok(())
-        })
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        read_task(&tx, id)?;
+        let dependents = dependent_ids(&tx, id)?;
+        if !dependents.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "task has dependents: {}",
+                join_ids(&dependents)
+            )));
+        }
+        tx.execute(
+            "DELETE FROM task_dependencies WHERE task_id = ?1",
+            [id.to_string()],
+        )?;
+        tx.execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn claim(&mut self, id: Uuid, agent: String) -> Result<TaskView, StoreError> {
-        self.commit(move |store| store.claim_uncommitted(id, agent))
-    }
-
-    fn claim_uncommitted(&mut self, id: Uuid, agent: String) -> Result<TaskView, StoreError> {
-        let blocked_by = self.blocked_ids(id)?;
-        let task = self.tasks.get_mut(&id).ok_or(StoreError::NotFound)?;
-        if task.status != Status::Todo {
-            return Err(action_conflict("claim", task.status));
-        }
-        if !blocked_by.is_empty() {
-            return Err(StoreError::Conflict(format!(
-                "task is blocked by: {}",
-                join_ids(&blocked_by)
-            )));
-        }
-        task.status = Status::InProgress;
-        task.claimed_by = Some(agent);
-        touch(task);
-        self.get(id)
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let view = claim_in_transaction(&tx, id, agent)?;
+        tx.commit()?;
+        Ok(view)
     }
 
     pub fn claim_next(
@@ -234,35 +224,51 @@ impl Store {
         agent: String,
         capabilities: &[String],
     ) -> Result<Option<TaskView>, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let capabilities: HashSet<&str> = capabilities.iter().map(String::as_str).collect();
-        let id = self
-            .tasks
-            .values()
-            .filter(|task| task.status == Status::Todo)
-            .filter(|task| {
-                task.requires
+        let candidate = {
+            let mut statement = tx.prepare(
+                "SELECT id, requires
+                 FROM tasks
+                 WHERE status = 'todo'
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM task_dependencies td
+                     JOIN tasks d ON d.id = td.depends_on
+                     WHERE td.task_id = tasks.id AND d.status <> 'done'
+                   )
+                 ORDER BY priority DESC, created_at ASC, id ASC",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut candidate = None;
+            while let Some(row) = rows.next()? {
+                let id_text: String = row.get(0)?;
+                let requires_text: String = row.get(1)?;
+                let requires: Vec<String> = decode_json(1, &requires_text)?;
+                if requires
                     .iter()
                     .all(|requirement| capabilities.contains(requirement.as_str()))
-            })
-            .filter(|task| {
-                task.depends_on.iter().all(|dependency| {
-                    self.tasks
-                        .get(dependency)
-                        .is_some_and(|task| task.status == Status::Done)
-                })
-            })
-            .min_by_key(|task| (Reverse(task.priority), task.created_at, task.id))
-            .map(|task| task.id);
-        match id {
-            Some(id) => self
-                .commit(move |store| store.claim_uncommitted(id, agent))
-                .map(Some),
-            None => Ok(None),
-        }
+                {
+                    candidate = Some(parse_uuid(0, &id_text)?);
+                    break;
+                }
+            }
+            candidate
+        };
+
+        let Some(id) = candidate else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let view = claim_in_transaction(&tx, id, agent)?;
+        tx.commit()?;
+        Ok(Some(view))
     }
 
     pub fn release(&mut self, id: Uuid, agent: &str) -> Result<TaskView, StoreError> {
-        self.commit(|store| store.transition_owned(id, agent, OwnedAction::Release, None))
+        self.transition_owned(id, agent, OwnedAction::Release, None)
     }
 
     pub fn complete(
@@ -271,7 +277,7 @@ impl Store {
         agent: &str,
         result: Option<Value>,
     ) -> Result<TaskView, StoreError> {
-        self.commit(|store| store.transition_owned(id, agent, OwnedAction::Complete, result))
+        self.transition_owned(id, agent, OwnedAction::Complete, result)
     }
 
     pub fn fail(
@@ -280,37 +286,45 @@ impl Store {
         agent: &str,
         result: Option<Value>,
     ) -> Result<TaskView, StoreError> {
-        self.commit(|store| store.transition_owned(id, agent, OwnedAction::Fail, result))
+        self.transition_owned(id, agent, OwnedAction::Fail, result)
     }
 
     pub fn cancel(&mut self, id: Uuid) -> Result<TaskView, StoreError> {
-        self.commit(|store| {
-            let task = store.tasks.get_mut(&id).ok_or(StoreError::NotFound)?;
-            if !matches!(
-                task.status,
-                Status::Todo | Status::InProgress | Status::Failed
-            ) {
-                return Err(action_conflict("cancel", task.status));
-            }
-            task.status = Status::Cancelled;
-            task.claimed_by = None;
-            touch(task);
-            store.get(id)
-        })
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut task = read_task(&tx, id)?;
+        if !matches!(
+            task.status,
+            Status::Todo | Status::InProgress | Status::Failed
+        ) {
+            return Err(action_conflict("cancel", task.status));
+        }
+        task.status = Status::Cancelled;
+        task.claimed_by = None;
+        touch(&mut task);
+        update_task(&tx, &task)?;
+        let view = view(&tx, task)?;
+        tx.commit()?;
+        Ok(view)
     }
 
     pub fn retry(&mut self, id: Uuid) -> Result<TaskView, StoreError> {
-        self.commit(|store| {
-            let task = store.tasks.get_mut(&id).ok_or(StoreError::NotFound)?;
-            if !matches!(task.status, Status::Failed | Status::Cancelled) {
-                return Err(action_conflict("retry", task.status));
-            }
-            task.status = Status::Todo;
-            task.claimed_by = None;
-            task.result = None;
-            touch(task);
-            store.get(id)
-        })
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut task = read_task(&tx, id)?;
+        if !matches!(task.status, Status::Failed | Status::Cancelled) {
+            return Err(action_conflict("retry", task.status));
+        }
+        task.status = Status::Todo;
+        task.claimed_by = None;
+        task.result = None;
+        touch(&mut task);
+        update_task(&tx, &task)?;
+        let view = view(&tx, task)?;
+        tx.commit()?;
+        Ok(view)
     }
 
     fn transition_owned(
@@ -320,7 +334,10 @@ impl Store {
         action: OwnedAction,
         result: Option<Value>,
     ) -> Result<TaskView, StoreError> {
-        let task = self.tasks.get_mut(&id).ok_or(StoreError::NotFound)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut task = read_task(&tx, id)?;
         if task.status != Status::InProgress {
             return Err(action_conflict(action.label(), task.status));
         }
@@ -332,143 +349,326 @@ impl Store {
         task.status = action.status();
         if matches!(action, OwnedAction::Release) {
             task.claimed_by = None;
-        }
-        if !matches!(action, OwnedAction::Release) {
+        } else {
             task.result = result;
         }
-        touch(task);
-        self.get(id)
+        touch(&mut task);
+        update_task(&tx, &task)?;
+        let view = view(&tx, task)?;
+        tx.commit()?;
+        Ok(view)
     }
+}
 
-    fn view(&self, task: &Task) -> TaskView {
-        let blocked_by = self.blocked_ids(task.id).unwrap_or_default();
-        let ready = task.status == Status::Todo && blocked_by.is_empty();
-        TaskView {
-            task: task.clone(),
-            blocked_by,
-            dependents: self.dependent_ids(task.id),
-            ready,
+fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    for (index, migration) in MIGRATIONS.iter().enumerate() {
+        let version = i64::try_from(index + 1).expect("migration count fits in SQLite integer");
+        if version <= current {
+            continue;
+        }
+        tx.execute_batch(migration)?;
+        tx.pragma_update(None, "user_version", version)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn insert_task(conn: &Connection, task: &Task) -> Result<(), StoreError> {
+    let requires = encode_json(&task.requires)?;
+    let metadata = encode_json(&task.metadata)?;
+    let result = task.result.as_ref().map(encode_json).transpose()?;
+    let version = sql_integer(task.version, "task version")?;
+    conn.execute(
+        "INSERT INTO tasks (
+           id, title, description, status, priority, requires, metadata, claimed_by, result,
+           created_at, updated_at, version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            task.id.to_string(),
+            task.title,
+            task.description,
+            status_text(task.status),
+            task.priority,
+            requires,
+            metadata,
+            task.claimed_by,
+            result,
+            format!("{:.9}", task.created_at),
+            format!("{:.9}", task.updated_at),
+            version,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_task(conn: &Connection, task: &Task) -> Result<(), StoreError> {
+    let requires = encode_json(&task.requires)?;
+    let metadata = encode_json(&task.metadata)?;
+    let result = task.result.as_ref().map(encode_json).transpose()?;
+    conn.execute(
+        "UPDATE tasks
+         SET title = ?2, description = ?3, status = ?4, priority = ?5, requires = ?6,
+             metadata = ?7, claimed_by = ?8, result = ?9, updated_at = ?10,
+             version = version + 1
+         WHERE id = ?1",
+        params![
+            task.id.to_string(),
+            task.title,
+            task.description,
+            status_text(task.status),
+            task.priority,
+            requires,
+            metadata,
+            task.claimed_by,
+            result,
+            format!("{:.9}", task.updated_at),
+        ],
+    )?;
+    Ok(())
+}
+
+fn replace_dependencies(
+    conn: &Connection,
+    task_id: Uuid,
+    dependencies: &[Uuid],
+) -> Result<(), StoreError> {
+    let mut statement = conn.prepare(
+        "INSERT INTO task_dependencies (task_id, depends_on, position) VALUES (?1, ?2, ?3)",
+    )?;
+    for (position, dependency) in dependencies.iter().enumerate() {
+        let position = sql_integer(position, "dependency position")?;
+        statement.execute(params![
+            task_id.to_string(),
+            dependency.to_string(),
+            position,
+        ])?;
+    }
+    Ok(())
+}
+
+fn read_task(conn: &Connection, id: Uuid) -> Result<Task, StoreError> {
+    let mut task = conn
+        .query_row(
+            "SELECT id, title, description, status, priority, requires, metadata, claimed_by,
+                    result, created_at, updated_at, version
+             FROM tasks WHERE id = ?1",
+            [id.to_string()],
+            decode_task,
+        )
+        .optional()?
+        .ok_or(StoreError::NotFound)?;
+    task.depends_on = dependency_ids(conn, id)?;
+    Ok(task)
+}
+
+fn decode_task(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let id_text: String = row.get(0)?;
+    let status: String = row.get(3)?;
+    let requires: String = row.get(5)?;
+    let metadata: String = row.get(6)?;
+    let result: Option<String> = row.get(8)?;
+    let created_at: String = row.get(9)?;
+    let updated_at: String = row.get(10)?;
+    let version: i64 = row.get(11)?;
+    Ok(Task {
+        id: parse_uuid(0, &id_text)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        status: parse_status(3, &status)?,
+        priority: row.get(4)?,
+        requires: decode_json(5, &requires)?,
+        depends_on: Vec::new(),
+        metadata: decode_json(6, &metadata)?,
+        claimed_by: row.get(7)?,
+        result: result
+            .as_deref()
+            .map(|value| decode_json(8, value))
+            .transpose()?,
+        created_at: parse_timestamp(9, &created_at)?,
+        updated_at: parse_timestamp(10, &updated_at)?,
+        version: version
+            .try_into()
+            .map_err(|error| conversion_error(11, Type::Integer, error))?,
+    })
+}
+
+fn list_views(conn: &Connection) -> rusqlite::Result<Vec<TaskView>> {
+    let mut statement = conn.prepare(
+        "SELECT id, title, description, status, priority, requires, metadata, claimed_by,
+                result, created_at, updated_at, version
+         FROM tasks
+         ORDER BY priority DESC, created_at ASC, id ASC",
+    )?;
+    let tasks = statement
+        .query_map([], decode_task)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    let mut views: Vec<_> = tasks
+        .into_iter()
+        .map(|task| TaskView {
+            task,
+            blocked_by: Vec::new(),
+            dependents: Vec::new(),
+            ready: false,
+        })
+        .collect();
+    let positions: HashMap<_, _> = views
+        .iter()
+        .enumerate()
+        .map(|(index, view)| (view.task.id, index))
+        .collect();
+
+    let mut statement = conn.prepare(
+        "SELECT td.task_id, td.depends_on, d.status
+         FROM task_dependencies td
+         JOIN tasks d ON d.id = td.depends_on
+         ORDER BY td.task_id, td.position",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let task_id = parse_uuid(0, &row.get::<_, String>(0)?)?;
+        let depends_on = parse_uuid(1, &row.get::<_, String>(1)?)?;
+        let dependency_status: String = row.get(2)?;
+        if let Some(&index) = positions.get(&task_id) {
+            views[index].task.depends_on.push(depends_on);
+            if dependency_status != "done" {
+                views[index].blocked_by.push(depends_on);
+            }
+        }
+        if let Some(&index) = positions.get(&depends_on) {
+            views[index].dependents.push(task_id);
         }
     }
-
-    fn blocked_ids(&self, id: Uuid) -> Result<Vec<Uuid>, StoreError> {
-        let task = self.tasks.get(&id).ok_or(StoreError::NotFound)?;
-        Ok(task
-            .depends_on
-            .iter()
-            .copied()
-            .filter(|dependency| {
-                self.tasks
-                    .get(dependency)
-                    .is_none_or(|task| task.status != Status::Done)
-            })
-            .collect())
+    for view in &mut views {
+        view.ready = view.task.status == Status::Todo && view.blocked_by.is_empty();
     }
+    Ok(views)
+}
 
-    fn dependent_ids(&self, id: Uuid) -> Vec<Uuid> {
-        self.tasks
-            .values()
-            .filter(|task| task.depends_on.contains(&id))
-            .map(|task| task.id)
-            .collect()
+fn view(conn: &Connection, task: Task) -> Result<TaskView, StoreError> {
+    let blocked_by = blocked_ids(conn, task.id)?;
+    let dependents = dependent_ids(conn, task.id)?;
+    let ready = task.status == Status::Todo && blocked_by.is_empty();
+    Ok(TaskView {
+        task,
+        blocked_by,
+        dependents,
+        ready,
+    })
+}
+
+fn dependency_ids(conn: &Connection, id: Uuid) -> rusqlite::Result<Vec<Uuid>> {
+    query_ids(
+        conn,
+        "SELECT depends_on FROM task_dependencies WHERE task_id = ?1 ORDER BY position",
+        id,
+    )
+}
+
+fn blocked_ids(conn: &Connection, id: Uuid) -> rusqlite::Result<Vec<Uuid>> {
+    query_ids(
+        conn,
+        "SELECT td.depends_on
+         FROM task_dependencies td
+         JOIN tasks d ON d.id = td.depends_on
+         WHERE td.task_id = ?1 AND d.status <> 'done'
+         ORDER BY td.position",
+        id,
+    )
+}
+
+fn dependent_ids(conn: &Connection, id: Uuid) -> rusqlite::Result<Vec<Uuid>> {
+    query_ids(
+        conn,
+        "SELECT task_id FROM task_dependencies WHERE depends_on = ?1 ORDER BY task_id",
+        id,
+    )
+}
+
+fn query_ids(conn: &Connection, sql: &str, id: Uuid) -> rusqlite::Result<Vec<Uuid>> {
+    let mut statement = conn.prepare(sql)?;
+    statement
+        .query_map([id.to_string()], |row| {
+            parse_uuid(0, &row.get::<_, String>(0)?)
+        })?
+        .collect()
+}
+
+fn validate_dependencies(
+    conn: &Connection,
+    id: Uuid,
+    dependencies: &[Uuid],
+) -> Result<(), StoreError> {
+    if dependencies.contains(&id) {
+        return Err(StoreError::Invalid(format!(
+            "task cannot depend on itself: {id}"
+        )));
     }
-
-    fn validate_dependencies(&self, id: Uuid, dependencies: &[Uuid]) -> Result<(), StoreError> {
-        if dependencies.contains(&id) {
+    for dependency in dependencies {
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+            [dependency.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
             return Err(StoreError::Invalid(format!(
-                "task cannot depend on itself: {id}"
+                "dependency does not exist: {dependency}"
             )));
         }
-        if let Some(missing) = dependencies
-            .iter()
-            .find(|dependency| !self.tasks.contains_key(dependency))
-        {
-            return Err(StoreError::Invalid(format!(
-                "dependency does not exist: {missing}"
+    }
+    Ok(())
+}
+
+fn validate_cycle(conn: &Connection, id: Uuid, dependencies: &[Uuid]) -> Result<(), StoreError> {
+    for dependency in dependencies {
+        let cycle = conn
+            .query_row(
+                "WITH RECURSIVE reach(id) AS (
+                   SELECT ?1
+                   UNION
+                   SELECT td.depends_on
+                   FROM task_dependencies td
+                   JOIN reach ON td.task_id = reach.id
+                 )
+                 SELECT 1 FROM reach WHERE id = ?2 LIMIT 1",
+                params![dependency.to_string(), id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if cycle {
+            return Err(StoreError::Conflict(format!(
+                "dependency cycle involving: {id}, {dependency}"
             )));
         }
-        Ok(())
     }
+    Ok(())
+}
 
-    fn validate_cycle(&self, id: Uuid, dependencies: &[Uuid]) -> Result<(), StoreError> {
-        for dependency in dependencies {
-            let mut visited = HashSet::new();
-            if self.reaches(*dependency, id, &mut visited) {
-                return Err(StoreError::Conflict(format!(
-                    "dependency cycle involving: {id}, {dependency}"
-                )));
-            }
-        }
-        Ok(())
+fn claim_in_transaction(
+    tx: &Transaction<'_>,
+    id: Uuid,
+    agent: String,
+) -> Result<TaskView, StoreError> {
+    let mut task = read_task(tx, id)?;
+    if task.status != Status::Todo {
+        return Err(action_conflict("claim", task.status));
     }
-
-    fn reaches(&self, current: Uuid, target: Uuid, visited: &mut HashSet<Uuid>) -> bool {
-        let mut stack = vec![current];
-        while let Some(current) = stack.pop() {
-            if current == target {
-                return true;
-            }
-            if !visited.insert(current) {
-                continue;
-            }
-            if let Some(task) = self.tasks.get(&current) {
-                stack.extend(task.depends_on.iter().copied());
-            }
-        }
-        false
+    let blocked_by = blocked_ids(tx, id)?;
+    if !blocked_by.is_empty() {
+        return Err(StoreError::Conflict(format!(
+            "task is blocked by: {}",
+            join_ids(&blocked_by)
+        )));
     }
-
-    fn persist(&self) -> Result<(), StoreError> {
-        self.save()
-            .map_err(|error| StoreError::Internal(format!("failed to persist board: {error}")))
-    }
-
-    fn commit<T>(
-        &mut self,
-        mutate: impl FnOnce(&mut Self) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
-        let snapshot = self.path.as_ref().map(|_| self.tasks.clone());
-        let result = match mutate(self) {
-            Ok(result) => result,
-            Err(error) => {
-                if let Some(tasks) = snapshot {
-                    self.tasks = tasks;
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.persist() {
-            if let Some(tasks) = snapshot {
-                self.tasks = tasks;
-            }
-            return Err(error);
-        }
-        Ok(result)
-    }
-
-    fn validate_loaded_graph(&self) -> io::Result<()> {
-        for (&id, task) in &self.tasks {
-            self.validate_dependencies(id, &task.depends_on)
-                .and_then(|()| self.validate_cycle(id, &task.depends_on))
-                .map_err(|error| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("invalid task {id}: {}", store_error_message(error)),
-                    )
-                })?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn insert_raw(&mut self, task: Task) {
-        self.tasks.insert(task.id, task);
-    }
-
-    #[cfg(test)]
-    fn task_mut(&mut self, id: Uuid) -> &mut Task {
-        self.tasks.get_mut(&id).expect("test task exists")
-    }
+    task.status = Status::InProgress;
+    task.claimed_by = Some(agent);
+    touch(&mut task);
+    update_task(tx, &task)?;
+    view(tx, task)
 }
 
 impl OwnedAction {
@@ -489,19 +689,60 @@ impl OwnedAction {
     }
 }
 
-fn store_error_message(error: StoreError) -> String {
-    match error {
-        StoreError::NotFound => "task not found".to_owned(),
-        StoreError::Invalid(message)
-        | StoreError::Conflict(message)
-        | StoreError::Internal(message) => message,
+fn encode_json(value: &impl serde::Serialize) -> Result<String, StoreError> {
+    serde_json::to_string(value).map_err(|error| StoreError::Internal(error.to_string()))
+}
+
+fn sql_integer(value: impl TryInto<i64>, description: &str) -> Result<i64, StoreError> {
+    value
+        .try_into()
+        .map_err(|_| StoreError::Internal(format!("{description} exceeds SQLite integer range")))
+}
+
+fn decode_json<T: serde::de::DeserializeOwned>(index: usize, value: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(value).map_err(|error| conversion_error(index, Type::Text, error))
+}
+
+fn parse_uuid(index: usize, value: &str) -> rusqlite::Result<Uuid> {
+    Uuid::parse_str(value).map_err(|error| conversion_error(index, Type::Text, error))
+}
+
+fn parse_timestamp(index: usize, value: &str) -> rusqlite::Result<Timestamp> {
+    value
+        .parse()
+        .map_err(|error| conversion_error(index, Type::Text, error))
+}
+
+fn parse_status(index: usize, value: &str) -> rusqlite::Result<Status> {
+    match value {
+        "todo" => Ok(Status::Todo),
+        "in_progress" => Ok(Status::InProgress),
+        "done" => Ok(Status::Done),
+        "failed" => Ok(Status::Failed),
+        "cancelled" => Ok(Status::Cancelled),
+        _ => Err(conversion_error(
+            index,
+            Type::Text,
+            format!("invalid task status: {value}"),
+        )),
     }
 }
 
-fn map_patch<T, U>(patch: Patch<T>, map: impl FnOnce(T) -> U) -> Patch<U> {
-    match patch {
-        Patch::Missing => Patch::Missing,
-        Patch::Present(value) => Patch::Present(map(value)),
+fn conversion_error(
+    index: usize,
+    value_type: Type,
+    error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, value_type, error.into())
+}
+
+fn status_text(status: Status) -> &'static str {
+    match status {
+        Status::Todo => "todo",
+        Status::InProgress => "in_progress",
+        Status::Done => "done",
+        Status::Failed => "failed",
+        Status::Cancelled => "cancelled",
     }
 }
 
@@ -531,12 +772,10 @@ fn touch(task: &mut Task) {
 }
 
 fn action_conflict(action: &str, status: Status) -> StoreError {
-    let status = serde_json::to_value(status)
-        .expect("status serialization is infallible")
-        .as_str()
-        .expect("status serializes as a string")
-        .to_owned();
-    StoreError::Conflict(format!("cannot {action} a task in status {status}"))
+    StoreError::Conflict(format!(
+        "cannot {action} a task in status {}",
+        status_text(status)
+    ))
 }
 
 fn join_ids(ids: &[Uuid]) -> String {
@@ -548,6 +787,8 @@ fn join_ids(ids: &[Uuid]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::model::CreateTask;
     use serde_json::json;
@@ -570,7 +811,7 @@ mod tests {
 
     #[test]
     fn create_get_and_dependency_validation() {
-        let mut store = Store::new(None);
+        let mut store = Store::in_memory();
         let id = create(&mut store, "task");
         assert_eq!(store.get(id).unwrap().task.title, "task");
 
@@ -593,7 +834,7 @@ mod tests {
 
     #[test]
     fn detects_short_and_long_cycles() {
-        let mut store = Store::new(None);
+        let mut store = Store::in_memory();
         let b = create(&mut store, "B");
         let mut a_request = request("A");
         a_request.depends_on.push(b);
@@ -607,7 +848,7 @@ mod tests {
             Err(StoreError::Conflict(message)) if message.contains("dependency cycle")
         ));
 
-        let mut store = Store::new(None);
+        let mut store = Store::in_memory();
         let c = create(&mut store, "C");
         let mut b_request = request("B");
         b_request.depends_on.push(c);
@@ -627,7 +868,7 @@ mod tests {
 
     #[test]
     fn dependency_completion_changes_readiness() {
-        let mut store = Store::new(None);
+        let mut store = Store::in_memory();
         let a = create(&mut store, "A");
         let mut b_request = request("B");
         b_request.depends_on.push(a);
@@ -644,7 +885,7 @@ mod tests {
 
     #[test]
     fn claim_selection_obeys_order_capabilities_and_readiness() {
-        let mut store = Store::new(None);
+        let mut store = Store::in_memory();
         let blocker = create(&mut store, "blocker");
 
         let mut blocked_request = request("blocked high");
@@ -661,15 +902,15 @@ mod tests {
         lower.priority = 2;
         let lower_id = store.create(lower).unwrap().task.id;
 
+        let common_time = Timestamp::constant(1_700_000_000, 0);
         let mut oldest = request("oldest");
         oldest.priority = 3;
-        let oldest_id = store.create(oldest).unwrap().task.id;
+        let oldest_id = Uuid::new_v4();
+        store.create_at(oldest_id, oldest, common_time).unwrap();
         let mut newest = request("newest");
         newest.priority = 3;
-        let newest_id = store.create(newest).unwrap().task.id;
-        let common_time = Timestamp::constant(1_700_000_000, 0);
-        store.task_mut(oldest_id).created_at = common_time;
-        store.task_mut(newest_id).created_at = common_time;
+        let newest_id = Uuid::new_v4();
+        store.create_at(newest_id, newest, common_time).unwrap();
         let expected_tie_winner = oldest_id.min(newest_id);
 
         let claimed = store.claim_next("none".to_owned(), &[]).unwrap().unwrap();
@@ -693,8 +934,31 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_text_order_matches_chronological_order() {
+        let mut store = Store::in_memory();
+        let whole_second: Timestamp = "2026-09-11T17:37:35Z".parse().unwrap();
+        let half_second: Timestamp = "2026-09-11T17:37:35.5Z".parse().unwrap();
+        let whole_second_id = Uuid::new_v4();
+        let half_second_id = Uuid::new_v4();
+
+        store
+            .create_at(whole_second_id, request("whole second"), whole_second)
+            .unwrap();
+        store
+            .create_at(half_second_id, request("half second"), half_second)
+            .unwrap();
+
+        let tasks = store.list().unwrap();
+        assert_eq!(tasks[0].task.id, whole_second_id);
+        assert_eq!(tasks[1].task.id, half_second_id);
+
+        let claimed = store.claim_next("agent".to_owned(), &[]).unwrap().unwrap();
+        assert_eq!(claimed.task.id, whole_second_id);
+    }
+
+    #[test]
     fn every_allowed_transition_and_forbidden_transitions() {
-        let mut store = Store::new(None);
+        let mut store = Store::in_memory();
         let released = create(&mut store, "released");
         store.claim(released, "a".to_owned()).unwrap();
         let task = store.release(released, "a").unwrap();
@@ -757,7 +1021,7 @@ mod tests {
 
     #[test]
     fn ownership_is_enforced() {
-        let mut store = Store::new(None);
+        let mut store = Store::in_memory();
         for action in ["release", "complete", "fail"] {
             let id = create(&mut store, action);
             store.claim(id, "owner".to_owned()).unwrap();
@@ -773,7 +1037,7 @@ mod tests {
 
     #[test]
     fn delete_rejects_dependents_then_removes_unreferenced_task() {
-        let mut store = Store::new(None);
+        let mut store = Store::in_memory();
         let parent = create(&mut store, "parent");
         let mut child = request("child");
         child.depends_on.push(parent);
@@ -788,42 +1052,88 @@ mod tests {
     }
 
     #[test]
-    fn persistence_round_trip_and_missing_file() {
+    fn reopen_round_trip_preserves_tasks_and_dependencies() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("nested").join("board.json");
-        let mut store = Store::load(Some(path.clone())).unwrap();
-        assert!(store.list().is_empty());
-        create(&mut store, "persisted");
-        store.save().unwrap();
+        let path = directory.path().join("orcis.db");
+        let path = path.to_str().unwrap();
+        let mut store = Store::open(path).unwrap();
+        let a = create(&mut store, "A");
+        let mut b_request = request("B");
+        b_request.priority = 9;
+        b_request.depends_on.push(a);
+        let created_b = store.create(b_request).unwrap();
+        let b = created_b.task.id;
+        let claimed_a = store.claim(a, "agent".to_owned()).unwrap();
+        drop(store);
 
-        let loaded = Store::load(Some(path)).unwrap();
-        assert_eq!(loaded.list()[0].task, store.list()[0].task);
+        let reopened = Store::open(path).unwrap();
+        let version: i64 = reopened
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let tasks = reopened.list().unwrap();
+        assert_eq!(tasks.len(), 2);
+        let reopened_a = tasks.iter().find(|task| task.task.id == a).unwrap();
+        assert_eq!(reopened_a.task, claimed_a.task);
+        let reopened_b = tasks.iter().find(|task| task.task.id == b).unwrap();
+        assert_eq!(reopened_b.task, created_b.task);
+        assert_eq!(reopened_b.blocked_by, vec![a]);
+        assert!(!reopened_b.ready);
     }
 
     #[test]
-    fn deep_cycle_detection_is_iterative() {
-        let mut store = Store::new(None);
-        let now = Timestamp::constant(1_700_000_000, 0);
+    fn migrations_are_idempotent() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("orcis.db");
+        let path = path.to_str().unwrap();
+        drop(Store::open(path).unwrap());
+        let reopened = Store::open(path).unwrap();
+        let version: i64 = reopened
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn deep_cycle_detection_handles_fifty_thousand_tasks() {
+        let mut store = Store::in_memory();
+        let now = Timestamp::constant(1_700_000_000, 0).to_string();
         let ids: Vec<_> = (1..=50_000).map(Uuid::from_u128).collect();
-        for (index, &id) in ids.iter().enumerate() {
-            store.insert_raw(Task {
-                id,
-                title: format!("task {index}"),
-                description: String::new(),
-                status: Status::Todo,
-                priority: 0,
-                requires: Vec::new(),
-                depends_on: index
-                    .checked_sub(1)
-                    .map_or_else(Vec::new, |previous| vec![ids[previous]]),
-                metadata: json!({}),
-                claimed_by: None,
-                result: None,
-                created_at: now,
-                updated_at: now,
-                version: 1,
-            });
+        let tx = store
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO tasks (
+                       id, title, description, status, priority, requires, metadata, claimed_by,
+                       result, created_at, updated_at, version
+                     ) VALUES (?1, ?2, '', 'todo', 0, '[]', '{}', NULL, NULL, ?3, ?3, 1)",
+                )
+                .unwrap();
+            for (index, id) in ids.iter().enumerate() {
+                insert
+                    .execute(params![id.to_string(), format!("task {index}"), now])
+                    .unwrap();
+            }
         }
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO task_dependencies (task_id, depends_on, position)
+                     VALUES (?1, ?2, 0)",
+                )
+                .unwrap();
+            for pair in ids.windows(2) {
+                insert
+                    .execute(params![pair[1].to_string(), pair[0].to_string()])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
 
         let patch = PatchTask {
             depends_on: Patch::Present(vec![*ids.last().unwrap()]),
@@ -836,49 +1146,11 @@ mod tests {
     }
 
     #[test]
-    fn persistence_failure_rolls_back_mutation() {
+    fn open_fails_when_parent_is_a_regular_file() {
         let directory = tempdir().unwrap();
         let regular_file = directory.path().join("file");
         fs::write(&regular_file, b"not a directory").unwrap();
-        let mut store = Store::new(Some(regular_file.join("board.json")));
-
-        assert!(matches!(
-            store.create(request("not persisted")),
-            Err(StoreError::Internal(_))
-        ));
-        assert!(store.list().is_empty());
-    }
-
-    #[test]
-    fn load_rejects_dangling_dependency() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("board.json");
-        let id = Uuid::new_v4();
-        let missing = Uuid::new_v4();
-        let board = json!({
-            "tasks": {
-                (id.to_string()): {
-                    "id": id,
-                    "title": "dangling",
-                    "description": "",
-                    "status": "todo",
-                    "priority": 0,
-                    "requires": [],
-                    "depends_on": [missing],
-                    "metadata": {},
-                    "claimed_by": null,
-                    "result": null,
-                    "created_at": "2026-09-11T00:00:00Z",
-                    "updated_at": "2026-09-11T00:00:00Z",
-                    "version": 1
-                }
-            }
-        });
-        fs::write(&path, serde_json::to_vec(&board).unwrap()).unwrap();
-
-        let error = Store::load(Some(path)).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
-        assert!(error.to_string().contains(&id.to_string()));
-        assert!(error.to_string().contains(&missing.to_string()));
+        let path = regular_file.join("orcis.db");
+        assert!(Store::open(path.to_str().unwrap()).is_err());
     }
 }
