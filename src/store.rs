@@ -7,9 +7,12 @@ use rusqlite::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::model::{CreateTask, Patch, PatchTask, Status, Task, TaskView};
+use crate::model::{
+    CreateTask, Label, Patch, PatchTask, Requirement, RequirementInput, Status, Task, TaskView,
+};
 
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE tasks (
   id          TEXT PRIMARY KEY,
   title       TEXT NOT NULL,
@@ -32,7 +35,48 @@ CREATE TABLE task_dependencies (
 );
 CREATE INDEX task_dependencies_depends_on ON task_dependencies(depends_on);
 CREATE INDEX tasks_status_priority ON tasks(status, priority DESC, created_at, id);
-"#];
+"#,
+    r#"
+CREATE TABLE task_requirements (
+  task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  description TEXT,
+  position    INTEGER NOT NULL,
+  PRIMARY KEY (task_id, name)
+);
+CREATE INDEX task_requirements_name ON task_requirements(name);
+INSERT INTO task_requirements (task_id, name, description, position)
+  SELECT tasks.id, je.value, NULL, je.key FROM tasks, json_each(tasks.requires) AS je;
+ALTER TABLE tasks DROP COLUMN requires;
+"#,
+];
+
+const LABELS_QUERY: &str = "SELECT tr.name,
+       (
+         SELECT tr2.description
+         FROM task_requirements tr2
+         JOIN tasks t2 ON t2.id = tr2.task_id
+         WHERE tr2.name = tr.name
+           AND tr2.description IS NOT NULL
+           AND t2.status IN ('todo', 'in_progress', 'failed')
+         ORDER BY t2.updated_at DESC, t2.id DESC
+         LIMIT 1
+       ) AS description,
+       COUNT(*) AS open_tasks,
+       SUM(
+         CASE WHEN t.status = 'todo' AND NOT EXISTS (
+           SELECT 1
+           FROM task_dependencies td
+           JOIN tasks d ON d.id = td.depends_on
+           WHERE td.task_id = t.id AND d.status <> 'done'
+         ) THEN 1 ELSE 0 END
+       ) AS ready_tasks
+FROM task_requirements tr
+JOIN tasks t ON t.id = tr.task_id
+WHERE t.status IN ('todo', 'in_progress', 'failed')
+  AND (?1 IS NULL OR tr.name = ?1)
+GROUP BY tr.name
+ORDER BY tr.name";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoreError {
@@ -91,7 +135,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_title(&request.title)?;
-        let requires = deduplicate(request.requires);
+        let requires = validate_requirements(request.requires)?;
         let depends_on = deduplicate(request.depends_on);
         validate_dependencies(&tx, id, &depends_on)?;
         validate_cycle(&tx, id, &depends_on)?;
@@ -112,6 +156,7 @@ impl Store {
             version: 1,
         };
         insert_task(&tx, &task)?;
+        replace_requirements(&tx, task.id, &task.requires)?;
         replace_dependencies(&tx, task.id, &task.depends_on)?;
         let view = view(&tx, task)?;
         tx.commit()?;
@@ -131,6 +176,55 @@ impl Store {
         let views = list_views(&tx)?;
         tx.commit()?;
         Ok(views)
+    }
+
+    pub fn labels(&mut self) -> Result<Vec<Label>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let labels = read_labels(&tx, None)?;
+        tx.commit()?;
+        Ok(labels)
+    }
+
+    pub fn set_label_description(
+        &mut self,
+        name: &str,
+        description: Option<String>,
+    ) -> Result<Label, StoreError> {
+        let name = name.trim();
+        validate_label_name(name)?;
+        let description = validate_requirement_description(description)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE tasks
+             SET updated_at = ?3, version = version + 1
+             WHERE status IN ('todo', 'in_progress', 'failed')
+               AND EXISTS (
+                 SELECT 1 FROM task_requirements tr
+                 WHERE tr.task_id = tasks.id
+                   AND tr.name = ?1
+                   AND tr.description IS NOT ?2
+               )",
+            params![name, description, format!("{:.9}", Timestamp::now())],
+        )?;
+        tx.execute(
+            "UPDATE task_requirements
+             SET description = ?2
+             WHERE name = ?1
+               AND description IS NOT ?2
+               AND task_id IN (
+                 SELECT id FROM tasks
+                 WHERE status IN ('todo', 'in_progress', 'failed')
+               )",
+            params![name, description],
+        )?;
+        let label = read_labels(&tx, Some(name))?
+            .into_iter()
+            .next()
+            .ok_or(StoreError::NotFound)?;
+        tx.commit()?;
+        Ok(label)
     }
 
     pub fn patch(&mut self, id: Uuid, patch: PatchTask) -> Result<TaskView, StoreError> {
@@ -171,7 +265,8 @@ impl Store {
             task.priority = priority;
         }
         if let Patch::Present(requires) = requires {
-            task.requires = deduplicate(requires);
+            task.requires = validate_requirements(requires)?;
+            replace_requirements(&tx, id, &task.requires)?;
         }
         if let Patch::Present(metadata) = metadata {
             task.metadata = metadata;
@@ -221,10 +316,10 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let capabilities: HashSet<&str> = capabilities.iter().map(String::as_str).collect();
-        let candidate = {
-            let mut statement = tx.prepare(
-                "SELECT id, requires
+        let capabilities = encode_json(&capabilities)?;
+        let candidate = tx
+            .query_row(
+                "SELECT id
                  FROM tasks
                  WHERE status = 'todo'
                    AND NOT EXISTS (
@@ -233,24 +328,21 @@ impl Store {
                      JOIN tasks d ON d.id = td.depends_on
                      WHERE td.task_id = tasks.id AND d.status <> 'done'
                    )
-                 ORDER BY priority DESC, created_at ASC, id ASC",
-            )?;
-            let mut rows = statement.query([])?;
-            let mut candidate = None;
-            while let Some(row) = rows.next()? {
-                let id_text: String = row.get(0)?;
-                let requires_text: String = row.get(1)?;
-                let requires: Vec<String> = decode_json(1, &requires_text)?;
-                if requires
-                    .iter()
-                    .all(|requirement| capabilities.contains(requirement.as_str()))
-                {
-                    candidate = Some(parse_uuid(0, &id_text)?);
-                    break;
-                }
-            }
-            candidate
-        };
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM task_requirements tr
+                     WHERE tr.task_id = tasks.id
+                       AND NOT EXISTS (
+                         SELECT 1 FROM json_each(?1) capability
+                         WHERE capability.value = tr.name
+                       )
+                   )
+                 ORDER BY priority DESC, created_at ASC, id ASC
+                 LIMIT 1",
+                [capabilities],
+                |row| parse_uuid(0, &row.get::<_, String>(0)?),
+            )
+            .optional()?;
 
         let Some(id) = candidate else {
             tx.commit()?;
@@ -370,22 +462,20 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
 }
 
 fn insert_task(conn: &Connection, task: &Task) -> Result<(), StoreError> {
-    let requires = encode_json(&task.requires)?;
     let metadata = encode_json(&task.metadata)?;
     let result = task.result.as_ref().map(encode_json).transpose()?;
     let version = sql_integer(task.version, "task version")?;
     conn.execute(
         "INSERT INTO tasks (
-           id, title, description, status, priority, requires, metadata, claimed_by, result,
+           id, title, description, status, priority, metadata, claimed_by, result,
            created_at, updated_at, version
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             task.id.to_string(),
             task.title,
             task.description,
             status_text(task.status),
             task.priority,
-            requires,
             metadata,
             task.claimed_by,
             result,
@@ -398,13 +488,12 @@ fn insert_task(conn: &Connection, task: &Task) -> Result<(), StoreError> {
 }
 
 fn update_task(conn: &Connection, task: &Task) -> Result<(), StoreError> {
-    let requires = encode_json(&task.requires)?;
     let metadata = encode_json(&task.metadata)?;
     let result = task.result.as_ref().map(encode_json).transpose()?;
     conn.execute(
         "UPDATE tasks
-         SET title = ?2, description = ?3, status = ?4, priority = ?5, requires = ?6,
-             metadata = ?7, claimed_by = ?8, result = ?9, updated_at = ?10,
+         SET title = ?2, description = ?3, status = ?4, priority = ?5,
+             metadata = ?6, claimed_by = ?7, result = ?8, updated_at = ?9,
              version = version + 1
          WHERE id = ?1",
         params![
@@ -413,13 +502,36 @@ fn update_task(conn: &Connection, task: &Task) -> Result<(), StoreError> {
             task.description,
             status_text(task.status),
             task.priority,
-            requires,
             metadata,
             task.claimed_by,
             result,
             format!("{:.9}", task.updated_at),
         ],
     )?;
+    Ok(())
+}
+
+fn replace_requirements(
+    conn: &Connection,
+    task_id: Uuid,
+    requirements: &[Requirement],
+) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM task_requirements WHERE task_id = ?1",
+        [task_id.to_string()],
+    )?;
+    let mut statement = conn.prepare(
+        "INSERT INTO task_requirements (task_id, name, description, position)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (position, requirement) in requirements.iter().enumerate() {
+        statement.execute(params![
+            task_id.to_string(),
+            requirement.name,
+            requirement.description,
+            sql_integer(position, "requirement position")?,
+        ])?;
+    }
     Ok(())
 }
 
@@ -445,7 +557,7 @@ fn replace_dependencies(
 fn read_task(conn: &Connection, id: Uuid) -> Result<Task, StoreError> {
     let mut task = conn
         .query_row(
-            "SELECT id, title, description, status, priority, requires, metadata, claimed_by,
+            "SELECT id, title, description, status, priority, metadata, claimed_by,
                     result, created_at, updated_at, version
              FROM tasks WHERE id = ?1",
             [id.to_string()],
@@ -453,6 +565,7 @@ fn read_task(conn: &Connection, id: Uuid) -> Result<Task, StoreError> {
         )
         .optional()?
         .ok_or(StoreError::NotFound)?;
+    task.requires = requirement_rows(conn, id)?;
     task.depends_on = dependency_ids(conn, id)?;
     Ok(task)
 }
@@ -460,37 +573,36 @@ fn read_task(conn: &Connection, id: Uuid) -> Result<Task, StoreError> {
 fn decode_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let id_text: String = row.get(0)?;
     let status: String = row.get(3)?;
-    let requires: String = row.get(5)?;
-    let metadata: String = row.get(6)?;
-    let result: Option<String> = row.get(8)?;
-    let created_at: String = row.get(9)?;
-    let updated_at: String = row.get(10)?;
-    let version: i64 = row.get(11)?;
+    let metadata: String = row.get(5)?;
+    let result: Option<String> = row.get(7)?;
+    let created_at: String = row.get(8)?;
+    let updated_at: String = row.get(9)?;
+    let version: i64 = row.get(10)?;
     Ok(Task {
         id: parse_uuid(0, &id_text)?,
         title: row.get(1)?,
         description: row.get(2)?,
         status: parse_status(3, &status)?,
         priority: row.get(4)?,
-        requires: decode_json(5, &requires)?,
+        requires: Vec::new(),
         depends_on: Vec::new(),
-        metadata: decode_json(6, &metadata)?,
-        claimed_by: row.get(7)?,
+        metadata: decode_json(5, &metadata)?,
+        claimed_by: row.get(6)?,
         result: result
             .as_deref()
-            .map(|value| decode_json(8, value))
+            .map(|value| decode_json(7, value))
             .transpose()?,
-        created_at: parse_timestamp(9, &created_at)?,
-        updated_at: parse_timestamp(10, &updated_at)?,
+        created_at: parse_timestamp(8, &created_at)?,
+        updated_at: parse_timestamp(9, &updated_at)?,
         version: version
             .try_into()
-            .map_err(|error| conversion_error(11, Type::Integer, error))?,
+            .map_err(|error| conversion_error(10, Type::Integer, error))?,
     })
 }
 
 fn list_views(conn: &Connection) -> rusqlite::Result<Vec<TaskView>> {
     let mut statement = conn.prepare(
-        "SELECT id, title, description, status, priority, requires, metadata, claimed_by,
+        "SELECT id, title, description, status, priority, metadata, claimed_by,
                 result, created_at, updated_at, version
          FROM tasks
          ORDER BY priority DESC, created_at ASC, id ASC",
@@ -514,6 +626,24 @@ fn list_views(conn: &Connection) -> rusqlite::Result<Vec<TaskView>> {
         .enumerate()
         .map(|(index, view)| (view.task.id, index))
         .collect();
+
+    let mut statement = conn.prepare(
+        "SELECT task_id, name, description
+         FROM task_requirements
+         ORDER BY task_id, position",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let task_id = parse_uuid(0, &row.get::<_, String>(0)?)?;
+        if let Some(&index) = positions.get(&task_id) {
+            views[index].task.requires.push(Requirement {
+                name: row.get(1)?,
+                description: row.get(2)?,
+            });
+        }
+    }
+    drop(rows);
+    drop(statement);
 
     let mut statement = conn.prepare(
         "SELECT td.task_id, td.depends_on, d.status
@@ -552,6 +682,43 @@ fn view(conn: &Connection, task: Task) -> Result<TaskView, StoreError> {
         dependents,
         ready,
     })
+}
+
+fn requirement_rows(conn: &Connection, id: Uuid) -> rusqlite::Result<Vec<Requirement>> {
+    let mut statement = conn.prepare(
+        "SELECT name, description
+         FROM task_requirements
+         WHERE task_id = ?1
+         ORDER BY position",
+    )?;
+    statement
+        .query_map([id.to_string()], |row| {
+            Ok(Requirement {
+                name: row.get(0)?,
+                description: row.get(1)?,
+            })
+        })?
+        .collect()
+}
+
+fn read_labels(conn: &Connection, name: Option<&str>) -> rusqlite::Result<Vec<Label>> {
+    let mut statement = conn.prepare(LABELS_QUERY)?;
+    statement
+        .query_map([name], |row| {
+            let open_tasks: i64 = row.get(2)?;
+            let ready_tasks: i64 = row.get(3)?;
+            Ok(Label {
+                name: row.get(0)?,
+                description: row.get(1)?,
+                open_tasks: open_tasks
+                    .try_into()
+                    .map_err(|error| conversion_error(2, Type::Integer, error))?,
+                ready_tasks: ready_tasks
+                    .try_into()
+                    .map_err(|error| conversion_error(3, Type::Integer, error))?,
+            })
+        })?
+        .collect()
 }
 
 fn dependency_ids(conn: &Connection, id: Uuid) -> rusqlite::Result<Vec<Uuid>> {
@@ -752,6 +919,67 @@ fn validate_title(title: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn validate_requirements(inputs: Vec<RequirementInput>) -> Result<Vec<Requirement>, StoreError> {
+    let mut requirements: Vec<Requirement> = Vec::new();
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    for input in inputs {
+        let (name, description) = match input {
+            RequirementInput::Name(name) => (name, None),
+            RequirementInput::Full(requirement) => (requirement.name, requirement.description),
+        };
+        let name = name.trim().to_owned();
+        validate_requirement_name(&name)?;
+        let description = validate_requirement_description(description)?;
+        if let Some(&position) = positions.get(&name) {
+            if requirements[position].description.is_none() && description.is_some() {
+                requirements[position].description = description;
+            }
+        } else {
+            positions.insert(name.clone(), requirements.len());
+            requirements.push(Requirement { name, description });
+        }
+    }
+    Ok(requirements)
+}
+
+fn validate_requirement_name(name: &str) -> Result<(), StoreError> {
+    validate_name(name, "requirement")
+}
+
+fn validate_label_name(name: &str) -> Result<(), StoreError> {
+    validate_name(name, "label")
+}
+
+fn validate_name(name: &str, kind: &str) -> Result<(), StoreError> {
+    if name.trim().is_empty() {
+        return Err(StoreError::Invalid(format!(
+            "invalid {kind} name: must not be empty"
+        )));
+    }
+    if name.chars().count() > 100 {
+        return Err(StoreError::Invalid(format!(
+            "invalid {kind} name: must be at most 100 characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_requirement_description(
+    description: Option<String>,
+) -> Result<Option<String>, StoreError> {
+    let description = description.map(|value| value.trim().to_owned());
+    let description = description.filter(|value| !value.is_empty());
+    if description
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 1000)
+    {
+        return Err(StoreError::Invalid(
+            "requirement description must be at most 1000 characters".to_owned(),
+        ));
+    }
+    Ok(description)
+}
+
 fn deduplicate<T: Eq + std::hash::Hash + Clone>(values: Vec<T>) -> Vec<T> {
     let mut seen = HashSet::new();
     values
@@ -803,6 +1031,13 @@ mod tests {
         store.create(request(title)).unwrap().task.id
     }
 
+    fn requirement(name: &str, description: Option<&str>) -> RequirementInput {
+        RequirementInput::Full(Requirement {
+            name: name.to_owned(),
+            description: description.map(str::to_owned),
+        })
+    }
+
     #[test]
     fn create_get_and_dependency_validation() {
         let mut store = Store::in_memory();
@@ -824,6 +1059,175 @@ mod tests {
             store.create_at(self_id, self_dependency, Timestamp::now()),
             Err(StoreError::Invalid(message)) if message.contains(&self_id.to_string())
         ));
+    }
+
+    #[test]
+    fn requirements_round_trip_and_deduplicate_descriptions() {
+        let mut store = Store::in_memory();
+        let mut task = request("requirements");
+        task.requires = vec![
+            RequirementInput::Name(" rust ".to_owned()),
+            requirement("architecture", None),
+            requirement("rust", Some("systems work")),
+            requirement("architecture", Some("module boundaries")),
+            requirement("rust", Some("ignored later description")),
+        ];
+
+        let created = store.create(task).unwrap();
+        assert_eq!(
+            created.task.requires,
+            vec![
+                Requirement {
+                    name: "rust".to_owned(),
+                    description: Some("systems work".to_owned()),
+                },
+                Requirement {
+                    name: "architecture".to_owned(),
+                    description: Some("module boundaries".to_owned()),
+                },
+            ]
+        );
+        assert_eq!(
+            store.get(created.task.id).unwrap().task.requires,
+            created.task.requires
+        );
+    }
+
+    #[test]
+    fn labels_include_only_open_tasks_with_counts_and_latest_description() {
+        let mut store = Store::in_memory();
+        let blocker = create(&mut store, "blocker");
+
+        let mut old = request("old description");
+        old.requires = vec![
+            requirement("shared", Some("old")),
+            requirement("old-only", Some("open")),
+        ];
+        old.depends_on = vec![blocker];
+        let old_id = store
+            .create_at(Uuid::new_v4(), old, Timestamp::constant(1_700_000_000, 0))
+            .unwrap()
+            .task
+            .id;
+
+        let mut new = request("new description");
+        new.requires = vec![requirement("shared", Some("new"))];
+        store
+            .create_at(Uuid::new_v4(), new, Timestamp::constant(1_700_000_001, 0))
+            .unwrap();
+
+        let mut done = request("done");
+        done.requires = vec![
+            requirement("shared", Some("closed")),
+            requirement("closed-only", Some("gone")),
+        ];
+        let done_id = store.create(done).unwrap().task.id;
+        store.claim(done_id, "agent".to_owned()).unwrap();
+        store.complete(done_id, "agent", None).unwrap();
+
+        let mut cancelled = request("cancelled");
+        cancelled.requires = vec![requirement("cancelled-only", None)];
+        let cancelled_id = store.create(cancelled).unwrap().task.id;
+        store.cancel(cancelled_id).unwrap();
+
+        let labels = store.labels().unwrap();
+        assert_eq!(
+            labels,
+            vec![
+                Label {
+                    name: "old-only".to_owned(),
+                    description: Some("open".to_owned()),
+                    open_tasks: 1,
+                    ready_tasks: 0,
+                },
+                Label {
+                    name: "shared".to_owned(),
+                    description: Some("new".to_owned()),
+                    open_tasks: 2,
+                    ready_tasks: 1,
+                },
+            ]
+        );
+
+        store
+            .patch(
+                old_id,
+                PatchTask {
+                    requires: Patch::Present(vec![
+                        requirement("shared", Some("patched")),
+                        requirement("old-only", Some("open")),
+                    ]),
+                    ..PatchTask::default()
+                },
+            )
+            .unwrap();
+        let shared = store
+            .labels()
+            .unwrap()
+            .into_iter()
+            .find(|label| label.name == "shared")
+            .unwrap();
+        assert_eq!(shared.description.as_deref(), Some("patched"));
+    }
+
+    #[test]
+    fn setting_label_description_updates_open_tasks_only() {
+        let mut store = Store::in_memory();
+        let mut first = request("first");
+        first.requires = vec![requirement("design", None)];
+        let first = store.create(first).unwrap().task;
+        let mut second = request("second");
+        second.requires = vec![requirement("design", Some("before"))];
+        let second = store.create(second).unwrap().task;
+        let mut closed = request("closed");
+        closed.requires = vec![requirement("design", Some("closed description"))];
+        let closed = store.create(closed).unwrap().task;
+        store.claim(closed.id, "agent".to_owned()).unwrap();
+        let closed = store.complete(closed.id, "agent", None).unwrap().task;
+
+        let label = store
+            .set_label_description("design", Some("  shared meaning  ".to_owned()))
+            .unwrap();
+        assert_eq!(label.description.as_deref(), Some("shared meaning"));
+        assert_eq!(label.open_tasks, 2);
+        for task in [&first, &second] {
+            let updated = store.get(task.id).unwrap().task;
+            assert_eq!(updated.version, task.version + 1);
+            assert_eq!(
+                updated.requires[0].description.as_deref(),
+                Some("shared meaning")
+            );
+        }
+        store
+            .set_label_description("design", Some("shared meaning".to_owned()))
+            .unwrap();
+        for task in [&first, &second] {
+            let updated = store.get(task.id).unwrap().task;
+            assert_eq!(updated.version, task.version + 1);
+        }
+        let closed_after = store.get(closed.id).unwrap().task;
+        assert_eq!(closed_after.version, closed.version);
+        assert_eq!(
+            closed_after.requires[0].description.as_deref(),
+            Some("closed description")
+        );
+        assert!(matches!(
+            store.set_label_description("unknown", None),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn claim_next_matches_requirement_names_only() {
+        let mut store = Store::in_memory();
+        let mut task = request("described");
+        task.requires = vec![requirement("architecture", Some("module boundaries"))];
+        let id = store.create(task).unwrap().task.id;
+        let claimed = store
+            .claim_next("agent".to_owned(), &["architecture".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.task.id, id);
     }
 
     #[test]
@@ -889,7 +1293,7 @@ mod tests {
 
         let mut frontend = request("frontend");
         frontend.priority = 50;
-        frontend.requires = vec!["frontend".to_owned()];
+        frontend.requires = vec![RequirementInput::Name("frontend".to_owned())];
         store.create(frontend).unwrap();
 
         let mut lower = request("lower");
@@ -1065,7 +1469,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let tasks = reopened.list().unwrap();
         assert_eq!(tasks.len(), 2);
         let reopened_a = tasks.iter().find(|task| task.task.id == a).unwrap();
@@ -1087,7 +1491,51 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn migrates_version_one_requirement_json_into_rows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("version-one.db");
+        let id = Uuid::new_v4();
+        let timestamp = "2026-09-13T12:00:00.000000000Z";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (
+                   id, title, description, status, priority, requires, metadata, claimed_by,
+                   result, created_at, updated_at, version
+                 ) VALUES (?1, 'migrated', '', 'todo', 0, '[\"rust\",\"api\"]', '{}',
+                           NULL, NULL, ?2, ?2, 1)",
+                params![id.to_string(), timestamp],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let rows = requirement_rows(&store.conn, id).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Requirement {
+                    name: "rust".to_owned(),
+                    description: None,
+                },
+                Requirement {
+                    name: "api".to_owned(),
+                    description: None,
+                },
+            ]
+        );
+        assert_eq!(store.get(id).unwrap().task.requires, rows);
     }
 
     #[test]
@@ -1103,9 +1551,9 @@ mod tests {
             let mut insert = tx
                 .prepare(
                     "INSERT INTO tasks (
-                       id, title, description, status, priority, requires, metadata, claimed_by,
+                       id, title, description, status, priority, metadata, claimed_by,
                        result, created_at, updated_at, version
-                     ) VALUES (?1, ?2, '', 'todo', 0, '[]', '{}', NULL, NULL, ?3, ?3, 1)",
+                     ) VALUES (?1, ?2, '', 'todo', 0, '{}', NULL, NULL, ?3, ?3, 1)",
                 )
                 .unwrap();
             for (index, id) in ids.iter().enumerate() {

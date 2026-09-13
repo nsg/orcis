@@ -18,6 +18,7 @@ Run it as a single static binary configured through environment variables, and o
 ## Features
 
 - Claim the highest-priority compatible task atomically.
+- Self-maintaining label vocabulary: requirements carry descriptions, `GET /labels` lists what open tasks need, and labels vanish when their tasks close.
 - Model dependency graphs and reject missing, self-referential, or cyclic edges.
 - Filter tasks by status, readiness, requirements, and claiming agent.
 - Enforce task-state transitions and ownership of active work.
@@ -35,7 +36,9 @@ Each task follows this lifecycle:
 
 A task is `ready` exactly when its status is `todo` and every task in `depends_on` is `done`. A `failed` or `cancelled` dependency keeps its dependents blocked until that dependency is retried and completed or the dependency edge is removed.
 
-Pool claims consider ready tasks whose `requires` values are a subset of the agent's `capabilities`. They select the highest `priority`, then the oldest `created_at`, then the lowest UUID. Selection and transition to `in_progress` happen under one store lock, so two agents cannot claim the same task.
+Agents read `GET /labels`, choose the labels that describe them, and claim with those names as their `capabilities`. Matching is exact by name, so the fuzzy judgement stays in the agent. Task authors reuse existing names and describe new ones.
+
+Pool claims consider ready tasks whose requirement names are a subset of the agent's `capabilities`. They select the highest `priority`, then the oldest `created_at`, then the lowest UUID. Selection and transition to `in_progress` happen under one store lock, so two agents cannot claim the same task.
 
 A typical agent loop is:
 
@@ -82,15 +85,15 @@ because B is blocked until A is done.
 ```bash
 A=$(curl -sS http://127.0.0.1:8080/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"title":"Design schema","priority":10,"requires":["rust"]}' | jq -r .id)
+  -d '{"title":"Design schema","priority":10,"requires":[{"name":"backend","description":"Server-side code and data modelling."}]}' | jq -r .id)
 
 curl -sS http://127.0.0.1:8080/tasks \
   -H 'Content-Type: application/json' \
-  -d "{\"title\":\"Implement API\",\"priority\":20,\"requires\":[\"rust\"],\"depends_on\":[\"$A\"]}"
+  -d "{\"title\":\"Implement API\",\"priority\":20,\"requires\":[\"backend\"],\"depends_on\":[\"$A\"]}"
 
 curl -sS http://127.0.0.1:8080/tasks/claim \
   -H 'Content-Type: application/json' \
-  -d '{"agent":"agent-1","capabilities":["rust"]}'
+  -d '{"agent":"agent-1","capabilities":["backend"]}'
 
 curl -sS "http://127.0.0.1:8080/tasks/$A/complete" \
   -H 'Content-Type: application/json' \
@@ -98,7 +101,7 @@ curl -sS "http://127.0.0.1:8080/tasks/$A/complete" \
 
 curl -sS http://127.0.0.1:8080/tasks/claim \
   -H 'Content-Type: application/json' \
-  -d '{"agent":"agent-1","capabilities":["rust"]}'
+  -d '{"agent":"agent-1","capabilities":["backend"]}'
 ```
 
 The second create shows B blocked by A:
@@ -109,7 +112,7 @@ The second create shows B blocked by A:
   "title": "Implement API",
   "status": "todo",
   "priority": 20,
-  "requires": ["rust"],
+  "requires": [{"name": "backend", "description": null}],
   "depends_on": ["93f6654d-db35-49ba-8030-caa595d70370"],
   "blocked_by": ["93f6654d-db35-49ba-8030-caa595d70370"],
   "dependents": [],
@@ -156,6 +159,8 @@ All request bodies shown below use `Content-Type: application/json`. Successful 
 | `POST` | `/tasks/{id}/fail` | Mark owned work `failed`. | `200` |
 | `POST` | `/tasks/{id}/cancel` | Cancel eligible work. | `200` |
 | `POST` | `/tasks/{id}/retry` | Return failed or cancelled work to `todo`. | `200` |
+| `GET` | `/labels` | List labels in use on open tasks. | `200` |
+| `PUT` | `/labels/{name}` | Set a label description on open tasks. | `200` |
 
 ### Task object
 
@@ -168,7 +173,7 @@ Fields above the divider are stored. Fields below it are derived on every read a
   "description": "",
   "status": "todo", // todo | in_progress | done | failed | cancelled
   "priority": 10,
-  "requires": ["rust"],
+  "requires": [{"name": "backend", "description": "Server-side code and data modelling."}],
   "depends_on": [],
   "metadata": {}, // any JSON value
   "claimed_by": null,
@@ -184,7 +189,7 @@ Fields above the divider are stored. Fields below it are derived on every read a
 }
 ```
 
-`version` starts at `1` and increments whenever that task is successfully mutated. `requires` and `depends_on` are deduplicated while preserving their first-seen order.
+`version` starts at `1` and increments whenever that task is successfully mutated. `requires` and `depends_on` are deduplicated while preserving their first-seen order. Requirement matching uses the exact `name`; descriptions do not affect claims.
 
 ### Create a task
 
@@ -195,13 +200,16 @@ Send `POST /tasks` with:
   "title": "Implement API",
   "description": "Add the task routes",
   "priority": 20,
-  "requires": ["rust", "api"],
+  "requires": [
+    {"name": "backend", "description": "Server-side code and data modelling."},
+    "api"
+  ],
   "depends_on": ["93f6654d-db35-49ba-8030-caa595d70370"],
   "metadata": {"owner": "platform"}
 }
 ```
 
-`title` is required, must contain a non-whitespace character, and is limited to 500 characters. `description` defaults to `""`, `priority` to `0`, `requires` and `depends_on` to `[]`, and `metadata` to `{}`. Every dependency must exist, a task cannot depend on itself, and the resulting graph cannot contain a cycle. Unknown fields are rejected. The response is `201 Created` with the new task.
+`title` is required, must contain a non-whitespace character, and is limited to 500 characters. `description` defaults to `""`, `priority` to `0`, `requires` and `depends_on` to `[]`, and `metadata` to `{}`. Each requirement may be a bare name or an object with `name` and optional `description`. Names are trimmed, must be nonempty, and are limited to 100 characters. Descriptions are trimmed, limited to 1000 characters, and stored as null when empty. Duplicate names preserve the first position and first non-null description. Every dependency must exist, a task cannot depend on itself, and the resulting graph cannot contain a cycle. Unknown fields are rejected. The response is `201 Created` with the new task.
 
 ### List and get tasks
 
@@ -211,7 +219,7 @@ Send `GET /tasks` with any combination of these filters. Different filters are A
 |---|---|
 | `status` | Match any repeated value: `todo`, `in_progress`, `done`, `failed`, or `cancelled`. |
 | `ready` | Match the derived readiness flag; accept only `true` or `false`. |
-| `requires` | Require every repeated tag to occur in the task's `requires` array. |
+| `requires` | Require every repeated name to occur in the task's `requires` array. |
 | `claimed_by` | Match the claiming agent exactly. |
 
 Unknown query parameters are rejected. Results have this envelope:
@@ -227,10 +235,10 @@ Tasks are sorted by descending priority, ascending creation time, then ascending
 Send `PATCH /tasks/{id}` with any subset of the create-time fields:
 
 ```json
-{"priority": 30, "requires": ["rust"], "metadata": null}
+{"priority": 30, "requires": ["backend"], "metadata": null}
 ```
 
-Each present field replaces the entire stored field; arrays and metadata are not merged. The same title and dependency validation applies as on creation. Explicit `null` is rejected for `title`, `description`, `priority`, `requires`, and `depends_on`; `metadata` accepts any JSON value, including `null`. Unknown fields are rejected.
+Each present field replaces the entire stored field; arrays and metadata are not merged. `requires` accepts the same bare names and objects, trimming, deduplication, and validation limits as creation. The same title and dependency validation applies as on creation. Explicit `null` is rejected for `title`, `description`, `priority`, `requires`, and `depends_on`; `metadata` accepts any JSON value, including `null`. Unknown fields are rejected.
 
 ### Delete a task
 
@@ -268,10 +276,28 @@ The claim, release, complete, and fail bodies require `agent`. Release, complete
 Send `POST /tasks/claim`:
 
 ```json
-{"agent":"agent-1","capabilities":["rust","api"]}
+{"agent":"agent-1","capabilities":["backend","cheap-ok"]}
 ```
 
 `agent` is required and `capabilities` defaults to `[]`. The operation atomically claims the best ready task whose requirements are all present in the supplied capabilities. A task with no requirements matches every agent. The response is `200 OK` with the claimed task, or `204 No Content` with an empty body when nothing matches.
+
+### Labels
+
+Send `GET /labels` to list the vocabulary carried by open tasks (`todo`, `in_progress`, or `failed`), including how many open and ready tasks use each label:
+
+```json
+{"labels":[{"name":"backend","description":"Server-side code and data modelling.","open_tasks":2,"ready_tasks":1}]}
+```
+
+Labels carried only by `done` or `cancelled` tasks disappear. When open tasks carry different non-null descriptions, the most recently updated task wins, with the greatest task ID breaking timestamp ties.
+
+Send `PUT /labels/{name}` to set the description on every open task carrying that exact name:
+
+```json
+{"description":"Server-side code and data modelling."}
+```
+
+The response is the updated label. A null or omitted `description` clears it. The description is trimmed and limited to 1000 characters; the path name must be nonempty and at most 100 characters. Closed tasks remain unchanged. If no open task carries the name, the response is `404 Not Found` with `{"error":"label not found"}`.
 
 ### Errors
 

@@ -20,7 +20,7 @@ pub struct Task {
     pub description: String,
     pub status: Status,
     pub priority: i64,
-    pub requires: Vec<String>,
+    pub requires: Vec<Requirement>,
     pub depends_on: Vec<Uuid>,
     pub metadata: Value,
     pub claimed_by: Option<String>,
@@ -28,6 +28,35 @@ pub struct Task {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub version: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Requirement {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RequirementInput {
+    Name(String),
+    Full(Requirement),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Label {
+    pub name: String,
+    pub description: Option<String>,
+    pub open_tasks: u64,
+    pub ready_tasks: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetLabelDescription {
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -48,7 +77,7 @@ pub struct CreateTask {
     #[serde(default)]
     pub priority: i64,
     #[serde(default)]
-    pub requires: Vec<String>,
+    pub requires: Vec<RequirementInput>,
     #[serde(default)]
     pub depends_on: Vec<Uuid>,
     #[serde(default = "empty_object")]
@@ -65,7 +94,7 @@ pub struct PatchTask {
     #[serde(default)]
     pub priority: Patch<i64>,
     #[serde(default)]
-    pub requires: Patch<Vec<String>>,
+    pub requires: Patch<Vec<RequirementInput>>,
     #[serde(default)]
     pub depends_on: Patch<Vec<Uuid>>,
     #[serde(default)]

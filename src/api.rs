@@ -9,7 +9,7 @@ use axum::{
     http::{Method, StatusCode, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::{
     model::{
-        AgentRequest, ClaimNextRequest, CreateTask, EmptyRequest, PatchTask, ResultRequest, Status,
-        TaskView,
+        AgentRequest, ClaimNextRequest, CreateTask, EmptyRequest, Label, PatchTask, ResultRequest,
+        SetLabelDescription, Status, TaskView,
     },
     store::{Store, StoreError},
 };
@@ -84,10 +84,10 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let Path(value) = Path::<String>::from_request_parts(parts, state)
             .await
-            .map_err(|_| ApiError::not_found())?;
+            .map_err(|_| ApiError::not_found("task not found"))?;
         Uuid::parse_str(&value)
             .map(Self)
-            .map_err(|_| ApiError::not_found())
+            .map_err(|_| ApiError::not_found("task not found"))
     }
 }
 
@@ -105,10 +105,10 @@ impl ApiError {
         }
     }
 
-    fn not_found() -> Self {
+    fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
-            message: "task not found".to_owned(),
+            message: message.into(),
         }
     }
 
@@ -127,7 +127,7 @@ impl ApiError {
 impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         match error {
-            StoreError::NotFound => Self::not_found(),
+            StoreError::NotFound => Self::not_found("task not found"),
             StoreError::Internal(message) => {
                 error!(%message, "internal store error");
                 Self {
@@ -174,6 +174,11 @@ struct TaskList {
     tasks: Vec<TaskView>,
 }
 
+#[derive(Serialize)]
+struct LabelList {
+    labels: Vec<Label>,
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -191,6 +196,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{id}/fail", post(fail_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/tasks/{id}/retry", post(retry_task))
+        .route("/labels", get(list_labels))
+        .route("/labels/{name}", put(set_label_description))
         .fallback(fallback)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
@@ -253,6 +260,16 @@ async fn index() -> AxumJson<Index> {
                 "POST",
                 "/tasks/{id}/retry",
                 "Retry a failed or cancelled task.",
+            ),
+            endpoint(
+                "GET",
+                "/labels",
+                "List labels in use on open tasks, with descriptions and counts.",
+            ),
+            endpoint(
+                "PUT",
+                "/labels/{name}",
+                "Set a label's description on every open task that carries it.",
             ),
         ],
     })
@@ -387,6 +404,25 @@ async fn retry_task(
     Ok(AxumJson(lock(&state).retry(id)?))
 }
 
+async fn list_labels(State(state): State<AppState>) -> Result<AxumJson<LabelList>, ApiError> {
+    Ok(AxumJson(LabelList {
+        labels: lock(&state).labels()?,
+    }))
+}
+
+async fn set_label_description(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(request): Json<SetLabelDescription>,
+) -> Result<AxumJson<Label>, ApiError> {
+    let name = name.trim();
+    match lock(&state).set_label_description(name, request.description) {
+        Ok(label) => Ok(AxumJson(label)),
+        Err(StoreError::NotFound) => Err(ApiError::not_found("label not found")),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn fallback() -> ApiError {
     ApiError {
         status: StatusCode::NOT_FOUND,
@@ -444,10 +480,12 @@ impl Filters {
     fn matches(&self, task: &TaskView) -> bool {
         (self.statuses.is_empty() || self.statuses.contains(&task.task.status))
             && self.ready.is_none_or(|ready| task.ready == ready)
-            && self
-                .requires
-                .iter()
-                .all(|requirement| task.task.requires.contains(requirement))
+            && self.requires.iter().all(|requirement| {
+                task.task
+                    .requires
+                    .iter()
+                    .any(|task_requirement| task_requirement.name == *requirement)
+            })
             && self
                 .claimed_by
                 .as_ref()

@@ -142,7 +142,10 @@ async fn task_crud_filters_and_json_errors() {
     )
     .await;
     let first_id = first["id"].as_str().unwrap();
-    assert_eq!(first["requires"], json!(["rust"]));
+    assert_eq!(
+        first["requires"],
+        json!([{"name": "rust", "description": null}])
+    );
     assert_eq!(first["version"], 1);
     assert_eq!(first["ready"], true);
 
@@ -250,6 +253,215 @@ async fn task_crud_filters_and_json_errors() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn described_requirements_labels_and_name_matching_work_over_http() {
+    let app = app(None);
+    let task = create_task(
+        &app,
+        json!({
+            "title": "design modules",
+            "requires": [
+                "design",
+                {
+                    "name": "architecture",
+                    "description": "Module boundaries and data flow."
+                }
+            ]
+        }),
+    )
+    .await;
+    let id = task["id"].as_str().unwrap();
+    assert_eq!(
+        task["requires"],
+        json!([
+            {"name": "design", "description": null},
+            {
+                "name": "architecture",
+                "description": "Module boundaries and data flow."
+            }
+        ])
+    );
+
+    let response = app.clone().oneshot(get("/labels")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        json!({
+            "labels": [
+                {
+                    "name": "architecture",
+                    "description": "Module boundaries and data flow.",
+                    "open_tasks": 1,
+                    "ready_tasks": 1
+                },
+                {
+                    "name": "design",
+                    "description": null,
+                    "open_tasks": 1,
+                    "ready_tasks": 1
+                }
+            ]
+        })
+    );
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/labels/design",
+            json!({"description": "Visual and interaction design."}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        json!({
+            "name": "design",
+            "description": "Visual and interaction design.",
+            "open_tasks": 1,
+            "ready_tasks": 1
+        })
+    );
+
+    let response = app
+        .clone()
+        .oneshot(get(&format!("/tasks/{id}")))
+        .await
+        .unwrap();
+    let updated = body_json(response).await;
+    assert_eq!(
+        updated["requires"][0]["description"],
+        "Visual and interaction design."
+    );
+    assert_eq!(updated["version"], 2);
+
+    let response = app
+        .clone()
+        .oneshot(get("/tasks?requires=design&requires=architecture"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(response).await["tasks"].as_array().unwrap().len(),
+        1
+    );
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/labels/nope",
+            json!({"description": "unused"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(response).await,
+        json!({"error": "label not found"})
+    );
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/labels/design",
+            json!({"description": "valid", "unknown": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/tasks/claim",
+            json!({"agent": "partial", "capabilities": ["design"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/tasks/claim",
+            json!({"agent": "worker", "capabilities": ["design", "architecture"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/tasks/{id}/complete"),
+            json!({"agent": "worker"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app.clone().oneshot(get("/labels")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await, json!({"labels": []}));
+
+    let protected = crate::app(Some("secret"));
+    let response = protected.oneshot(get("/labels")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn label_names_are_trimmed_and_validated() {
+    let app = app(None);
+    let task = create_task(
+        &app,
+        json!({"title": "backend task", "requires": ["backend"]}),
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/labels/%20backend%20",
+            json!({"description": "Server-side work"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["name"], "backend");
+
+    let response = app
+        .clone()
+        .oneshot(get(&format!("/tasks/{}", task["id"].as_str().unwrap())))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(response).await["requires"][0]["description"],
+        "Server-side work"
+    );
+
+    let response = app
+        .oneshot(json_request(
+            "PUT",
+            "/labels/%20",
+            json!({"description": "invalid"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("label name")
+    );
 }
 
 #[tokio::test]
