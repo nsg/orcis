@@ -24,6 +24,8 @@ use crate::{
     store::{Store, StoreError},
 };
 
+const AGENT_DOCS: &str = include_str!("../docs/agent.md");
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
@@ -176,6 +178,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(health))
+        .route("/docs.md", get(agent_docs))
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/claim", post(claim_next))
         .route(
@@ -199,7 +202,7 @@ async fn authorize(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if request.method() == Method::GET && request.uri().path() == "/healthz" {
+    if request.method() == Method::GET && matches!(request.uri().path(), "/healthz" | "/docs.md") {
         return Ok(next.run(request).await);
     }
     let Some(expected) = &state.expected_authorization else {
@@ -226,6 +229,11 @@ async fn index() -> AxumJson<Index> {
         endpoints: vec![
             endpoint("GET", "/", "Discover the API endpoints."),
             endpoint("GET", "/healthz", "Check service health."),
+            endpoint(
+                "GET",
+                "/docs.md",
+                "Read the agent documentation as Markdown.",
+            ),
             endpoint("POST", "/tasks", "Create a task."),
             endpoint("GET", "/tasks", "List and filter tasks."),
             endpoint("GET", "/tasks/{id}", "Get a task."),
@@ -260,6 +268,13 @@ fn endpoint(method: &'static str, path: &'static str, description: &'static str)
 
 async fn health() -> AxumJson<Health> {
     AxumJson(Health { status: "ok" })
+}
+
+async fn agent_docs() -> impl IntoResponse {
+    (
+        [("content-type", "text/markdown; charset=utf-8")],
+        AGENT_DOCS,
+    )
 }
 
 async fn create_task(

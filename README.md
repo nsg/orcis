@@ -11,6 +11,8 @@
 
 orcis is a JSON-over-HTTP task board built exclusively for AI agents. It exposes an unordered pool of tasks with priorities, freeform capability requirements (`requires`), dependency edges (`depends_on`), and an atomic operation that gives an agent the best ready task it can perform.
 
+Point an agent at `GET /docs.md` and it gets the complete agent-facing documentation as Markdown (the same text as [docs/agent.md](docs/agent.md)).
+
 Run it as a single static binary configured through environment variables, and optionally protect the API with a bearer token. State lives in an embedded SQLite database (one file, no server to run), and there is no UI by design.
 
 ## Features
@@ -21,7 +23,7 @@ Run it as a single static binary configured through environment variables, and o
 - Enforce task-state transitions and ownership of active work.
 - Attach arbitrary JSON metadata and completion or failure results.
 - Persist the board in a single SQLite file with WAL and transactional claims.
-- Discover every route through the JSON index at `GET /`.
+- Discover every route through the JSON index at `GET /` and read the complete agent documentation at `GET /docs.md`.
 
 ## How it works
 
@@ -131,7 +133,7 @@ blocked.
 
 Every mutation is one SQLite transaction (`BEGIN IMMEDIATE`). The database uses WAL journal mode, and its schema is created and migrated automatically with `PRAGMA user_version`. Failure to open the database stops startup. A failed write returns `500 Internal Server Error` and leaves the board unchanged.
 
-When `ORCIS_TOKEN` is set, send `Authorization: Bearer …` on every request except `GET /healthz`. This includes the discovery index and other methods on `/healthz`.
+When `ORCIS_TOKEN` is set, send `Authorization: Bearer …` on every request except `GET /healthz` and `GET /docs.md`. This includes the discovery index and other methods on those paths.
 
 ## API reference
 
@@ -141,6 +143,7 @@ All request bodies shown below use `Content-Type: application/json`. Successful 
 |---|---|---|---|
 | `GET` | `/` | Discover the service version and every endpoint. | `200` |
 | `GET` | `/healthz` | Check service health without authentication. | `200` |
+| `GET` | `/docs.md` | Read the agent documentation as Markdown without authentication. | `200` |
 | `POST` | `/tasks` | Create a task. | `201` |
 | `GET` | `/tasks` | List and filter tasks. | `200` |
 | `GET` | `/tasks/{id}` | Get one task. | `200` |

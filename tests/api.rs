@@ -37,6 +37,11 @@ async fn body_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
 async fn create_task(app: &Router, body: Value) -> Value {
     let response = app
         .clone()
@@ -54,11 +59,72 @@ async fn index_and_health_are_json() {
     assert_eq!(response.status(), StatusCode::OK);
     let index = body_json(response).await;
     assert_eq!(index["name"], "orcis");
-    assert!(index["endpoints"].as_array().unwrap().len() >= 14);
+    assert!(index["endpoints"].as_array().unwrap().len() >= 15);
 
     let response = app.oneshot(get("/healthz")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_json(response).await, json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn agent_docs_are_public_markdown_and_cover_the_index() {
+    let unprotected = app(None);
+    let response = unprotected.clone().oneshot(get("/docs.md")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/markdown")
+    );
+    let docs = body_text(response).await;
+    assert!(docs.starts_with("# orcis"));
+
+    let response = unprotected.clone().oneshot(get("/")).await.unwrap();
+    let index = body_json(response).await;
+    for endpoint in index["endpoints"].as_array().unwrap() {
+        let method = endpoint["method"].as_str().unwrap();
+        let path = endpoint["path"].as_str().unwrap();
+        assert!(
+            docs.contains(&format!("`{method} {path}`")),
+            "docs missing endpoint `{method} {path}`"
+        );
+    }
+
+    let response = unprotected
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        body_json(response).await,
+        json!({"error": "method not allowed"})
+    );
+
+    let protected = app(Some("secret"));
+    let response = protected.clone().oneshot(get("/docs.md")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = protected
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/docs.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await, json!({"error": "unauthorized"}));
 }
 
 #[tokio::test]
@@ -297,7 +363,7 @@ async fn dependency_chain_blocks_then_unlocks() {
 }
 
 #[tokio::test]
-async fn auth_exempts_health_only() {
+async fn auth_exempts_health_and_agent_docs_only() {
     let app = app(Some("secret"));
     let response = app.clone().oneshot(get("/tasks")).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
