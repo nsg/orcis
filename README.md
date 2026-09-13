@@ -13,7 +13,7 @@ orcis is a vibe-coded JSON-over-HTTP task board built exclusively for AI agents.
 
 Point an agent at `GET /docs.md` and it gets the complete agent-facing documentation as Markdown (the same text as [docs/agent.md](docs/agent.md)).
 
-Run it as a single static binary configured through environment variables, and optionally protect the API with a bearer token. State lives in an embedded SQLite database (one file, no server to run), and there is no UI by design.
+Run it as a single static binary configured through environment variables, and optionally protect the API with a bearer token. State lives in an embedded SQLite database (one file, no server to run). A read-only board for humans is served at `/ui`, while every mutation stays in the JSON API.
 
 ## Features
 
@@ -25,6 +25,7 @@ Run it as a single static binary configured through environment variables, and o
 - Attach arbitrary JSON metadata and completion or failure results.
 - Persist the board in a single SQLite file with WAL and transactional claims.
 - Discover every route through the JSON index at `GET /` and read the complete agent documentation at `GET /docs.md`.
+- Watch the board in a browser at `/ui`: a read-only view that polls the API and never writes.
 
 ## How it works
 
@@ -75,6 +76,12 @@ docker run --rm -p 8080:8080 \
 ```
 
 The mounted volume must be writable by uid `65534`, the non-root user in the image.
+
+### Watch the board
+
+Open `http://127.0.0.1:8080/ui`. The page polls the board every five seconds. When `ORCIS_TOKEN` is set, the page asks for the token once per browser session and keeps it in session storage.
+
+<p align="center"><img src="docs/board.png" alt="The read-only board in a browser: summary tiles, four status columns, and a task detail panel." width="900"></p>
 
 ### Exercise the dependency flow
 
@@ -136,7 +143,7 @@ blocked.
 
 Every mutation is one SQLite transaction (`BEGIN IMMEDIATE`). The database uses WAL journal mode, and its schema is created and migrated automatically with `PRAGMA user_version`. Failure to open the database stops startup. A failed write returns `500 Internal Server Error` and leaves the board unchanged.
 
-When `ORCIS_TOKEN` is set, send `Authorization: Bearer …` on every request except `GET /healthz` and `GET /docs.md`. This includes the discovery index and other methods on those paths.
+When `ORCIS_TOKEN` is set, send `Authorization: Bearer …` on every request except `GET /healthz`, `GET /docs.md`, and `GET /ui`. This includes the discovery index and other methods on those paths.
 
 ## API reference
 
@@ -147,6 +154,7 @@ All request bodies shown below use `Content-Type: application/json`. Successful 
 | `GET` | `/` | Discover the service version and every endpoint. | `200` |
 | `GET` | `/healthz` | Check service health without authentication. | `200` |
 | `GET` | `/docs.md` | Read the agent documentation as Markdown without authentication. | `200` |
+| `GET` | `/ui` | View the board read-only in a browser. | `200` |
 | `POST` | `/tasks` | Create a task. | `201` |
 | `GET` | `/tasks` | List and filter tasks. | `200` |
 | `GET` | `/tasks/{id}` | Get one task. | `200` |
