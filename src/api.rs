@@ -24,7 +24,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
-    artifact::{ArtifactFiles, MAX_ARTIFACT_BYTES, UploadError},
+    artifact::{ARTIFACT_DIRECTORY, ArtifactFiles, MAX_ARTIFACT_BYTES, UploadError},
     model::{
         AgentRequest, Artifact, ClaimNextRequest, CreateTask, EmptyRequest, Label, PatchTask,
         ResultRequest, SetLabelDescription, Status, TaskView,
@@ -44,7 +44,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(store: Store, token: Option<String>) -> Self {
-        Self::with_artifact_dir(store, token, "orcis.db.artifacts")
+        Self::with_artifact_dir(store, token, ARTIFACT_DIRECTORY)
             .expect("default artifact directory opens")
     }
 

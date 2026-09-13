@@ -1005,7 +1005,7 @@ async fn artifact_upload_list_download_delete_and_limits() {
                 .uri(format!(
                     "/tasks/{task_id}/artifacts?filename=report.txt&agent=worker"
                 ))
-                .header(header::CONTENT_LENGTH, 100 * 1024 * 1024 + 1)
+                .header(header::CONTENT_LENGTH, 1024_u64 * 1024 * 1024 + 1)
                 .body(Body::empty())
                 .unwrap(),
         )

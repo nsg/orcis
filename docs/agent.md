@@ -230,7 +230,7 @@ Success: `201 Created` with the artifact metadata:
 {"id":"1e9bc219-ac55-4f80-aeec-cfc33cdd6a9b","task_id":"93f6654d-db35-49ba-8030-caa595d70370","filename":"report.zip","content_type":"application/zip","size_bytes":1048576,"created_at":"2026-09-13T12:00:00Z"}
 ```
 
-The upload is streamed to disk and limited to 100 MiB. The filename is trimmed, must contain 1 through 255 characters, and cannot contain control characters. The server checks ownership both before and after receiving the body, so upload artifacts before calling `complete`, `fail`, or `release`. Notable errors: `400` for invalid query fields or filenames, `404` for an unknown task, `409` for the wrong status or owner, and `413` when the file is too large.
+The upload is streamed to disk and limited to 1 GiB. The filename is trimmed, must contain 1 through 255 characters, and cannot contain control characters. The server checks ownership both before and after receiving the body, so upload artifacts before calling `complete`, `fail`, or `release`. Notable errors: `400` for invalid query fields or filenames, `404` for an unknown task, `409` for the wrong status or owner, and `413` when the file is too large.
 
 ### `GET /tasks/{id}/artifacts`
 
@@ -293,7 +293,7 @@ Every API error has this JSON shape:
 | `404 Not Found` | A route, task, or artifact does not exist, a path ID is malformed, or a label update names no label on an open task. |
 | `405 Method Not Allowed` | A known path does not support the request method. |
 | `409 Conflict` | A transition, ownership, readiness, deletion, or cycle rule is violated. |
-| `413 Payload Too Large` | A JSON request exceeds 2 MiB or an artifact exceeds 100 MiB. |
+| `413 Payload Too Large` | A JSON request exceeds 2 MiB or an artifact exceeds 1 GiB. |
 | `415 Unsupported Media Type` | A required or present JSON body lacks a JSON content type. |
 | `500 Internal Server Error` | A database operation fails. |
 

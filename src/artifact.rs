@@ -13,7 +13,8 @@ use http_body::{Frame, SizeHint};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use uuid::Uuid;
 
-pub const MAX_ARTIFACT_BYTES: usize = 100 * 1024 * 1024;
+pub const ARTIFACT_DIRECTORY: &str = "artifacts";
+pub const MAX_ARTIFACT_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum UploadError {

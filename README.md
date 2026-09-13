@@ -22,7 +22,7 @@ Run it as a single static binary configured through environment variables, and o
 - Model dependency graphs and reject missing, self-referential, or cyclic edges.
 - Filter tasks by status, readiness, requirements, and claiming agent.
 - Enforce task-state transitions and ownership of active work.
-- Attach arbitrary JSON metadata, completion or failure results, and binary artifacts up to 100 MiB.
+- Attach arbitrary JSON metadata, completion or failure results, and binary artifacts up to 1 GiB.
 - Persist the board in a single SQLite file with WAL and transactional claims.
 - Discover every route through the JSON index at `GET /` and read the complete agent documentation at `GET /docs.md`.
 - Watch the board in a browser at `/ui`: a read-only view that polls the API and never writes.
@@ -76,7 +76,7 @@ docker run --rm -p 8080:8080 \
   ghcr.io/nsg/orcis:latest
 ```
 
-The mounted volume stores both `orcis.db` and `orcis.db.artifacts`, and must be writable by uid `65534`, the non-root user in the image.
+The mounted volume stores both `orcis.db` and the `artifacts` directory, and must be writable by uid `65534`, the non-root user in the image.
 
 ### Watch the board
 
@@ -144,7 +144,7 @@ blocked.
 
 Every mutation is one SQLite transaction (`BEGIN IMMEDIATE`). The database uses WAL journal mode, and its schema is created and migrated automatically with `PRAGMA user_version`. Failure to open the database stops startup. A failed write returns `500 Internal Server Error` and leaves the board unchanged.
 
-Artifacts are stored in a sibling directory formed by appending `.artifacts` to `ORCIS_DB_PATH`. Uploads are limited to 100 MiB. A collector runs at startup and hourly, removing artifacts seven days after a task becomes `done` or `cancelled`, along with old files that no longer have database records. Back up the database and artifact directory together.
+Artifacts are stored in an `artifacts` directory beside `ORCIS_DB_PATH`. Uploads are limited to 1 GiB. A collector runs at startup and hourly, removing artifacts seven days after a task becomes `done` or `cancelled`, along with old files that no longer have database records. Back up the database and artifact directory together.
 
 When `ORCIS_TOKEN` is set, send `Authorization: Bearer …` on every request except `GET /healthz`, `GET /docs.md`, and `GET /ui`. This includes the discovery index and other methods on those paths.
 
@@ -310,7 +310,7 @@ The response is `201 Created` with metadata:
 }
 ```
 
-Only the agent that owns an `in_progress` task may upload to it. The streamed body may be empty and must not exceed 100 MiB. Upload every artifact before calling `complete`, then put its ID in the task result when that helps the receiving agent.
+Only the agent that owns an `in_progress` task may upload to it. The streamed body may be empty and must not exceed 1 GiB. Upload every artifact before calling `complete`, then put its ID in the task result when that helps the receiving agent.
 
 `GET /tasks/{id}/artifacts` returns `{"artifacts": [...]}`. Download the raw bytes with `GET /tasks/{id}/artifacts/{artifact_id}`; the response includes the stored content type, content length, and an attachment filename. `DELETE` on the same path removes the artifact immediately and returns `204 No Content`.
 
@@ -357,7 +357,7 @@ Every API error is JSON with one field:
 | `404 Not Found` | A route, task, or artifact does not exist, or a UUID in the path is malformed. |
 | `405 Method Not Allowed` | A known route does not support the requested method. |
 | `409 Conflict` | A transition, ownership, readiness, deletion, or dependency-cycle rule is violated. |
-| `413 Payload Too Large` | A JSON request exceeds 2 MiB or an artifact exceeds 100 MiB. |
+| `413 Payload Too Large` | A JSON request exceeds 2 MiB or an artifact exceeds 1 GiB. |
 | `415 Unsupported Media Type` | A required or present JSON body does not have a JSON content type. |
 | `500 Internal Server Error` | A database operation fails. The transaction is rolled back. |
 
