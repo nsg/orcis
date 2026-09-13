@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use jiff::Timestamp;
 use rusqlite::{
@@ -122,7 +125,7 @@ enum OwnedAction {
 }
 
 impl Store {
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.execute_batch(

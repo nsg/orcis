@@ -17,10 +17,10 @@ COPY --from=build /orcis /orcis
 COPY --from=build --chown=65534:65534 /data /data
 
 # Loopback is the safe default for a local binary; a container must listen on
-# all interfaces. The SQLite database lives under /data; mount a volume there
+# all interfaces. All persistent state lives under /data; mount a volume there
 # that is writable by uid 65534 (the process is not root) to keep it.
 ENV ORCIS_ADDR=0.0.0.0:8080
-ENV ORCIS_DB_PATH=/data/orcis.db
+ENV ORCIS_DATA_PATH=/data
 USER 65534:65534
 EXPOSE 8080
 ENTRYPOINT ["/orcis"]

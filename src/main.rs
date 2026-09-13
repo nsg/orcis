@@ -30,8 +30,15 @@ async fn run() -> Result<(), String> {
         .with_env_filter(filter)
         .init();
 
-    let store = Store::open(&config.db_path)
-        .map_err(|error| format!("failed to open ORCIS_DB_PATH {:?}: {error}", config.db_path))?;
+    std::fs::create_dir_all(&config.data_path).map_err(|error| {
+        format!(
+            "failed to create ORCIS_DATA_PATH {:?}: {error}",
+            config.data_path
+        )
+    })?;
+    let db_path = config.db_path();
+    let store = Store::open(&db_path)
+        .map_err(|error| format!("failed to open database {db_path:?}: {error}"))?;
     let artifact_dir = config.artifact_dir();
     let state = AppState::with_artifact_dir(store, config.token, &artifact_dir)
         .map_err(|error| format!("failed to open artifact directory {artifact_dir:?}: {error}"))?;
@@ -43,7 +50,7 @@ async fn run() -> Result<(), String> {
     let bound = listener
         .local_addr()
         .map_err(|error| format!("failed to inspect bound address: {error}"))?;
-    info!(address = %bound, database = %config.db_path, artifacts = %artifact_dir.display(), "orcis listening");
+    info!(address = %bound, data = %config.data_path.display(), database = %db_path.display(), artifacts = %artifact_dir.display(), "orcis listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

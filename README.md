@@ -68,7 +68,7 @@ Run the published image with throwaway state. The database is written inside the
 docker run --rm -p 8080:8080 ghcr.io/nsg/orcis:latest
 ```
 
-Persist the board in a named volume. The container already defaults to `ORCIS_DB_PATH=/data/orcis.db`, so only the volume mount is needed:
+Persist the board in a named volume. The container already defaults to `ORCIS_DATA_PATH=/data`, so only the volume mount is needed:
 
 ```bash
 docker run --rm -p 8080:8080 \
@@ -138,13 +138,15 @@ blocked.
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `ORCIS_ADDR` | `127.0.0.1:8080` | Socket address on which to listen. The container overrides this with `0.0.0.0:8080`. |
-| `ORCIS_DB_PATH` | `orcis.db` | SQLite database file; created on first start. SQLite's own `:memory:` name gives a throwaway board. |
+| `ORCIS_DATA_PATH` | `.` | Directory for persistent data; created on first start. The database is stored as `orcis.db` and artifacts under `artifacts/`. |
 | `ORCIS_TOKEN` | unset | Expected bearer token. Disable authentication when unset. |
 | `RUST_LOG` | `info` | `tracing-subscriber` environment-filter directive. |
 
+`ORCIS_DATA_PATH` replaces the former `ORCIS_DB_PATH` file setting. Move an existing database to `<ORCIS_DATA_PATH>/orcis.db`; startup rejects the old variable so a deployment cannot silently open a new empty board.
+
 Every mutation is one SQLite transaction (`BEGIN IMMEDIATE`). The database uses WAL journal mode, and its schema is created and migrated automatically with `PRAGMA user_version`. Failure to open the database stops startup. A failed write returns `500 Internal Server Error` and leaves the board unchanged.
 
-Artifacts are stored in an `artifacts` directory beside `ORCIS_DB_PATH`. Uploads are limited to 1 GiB. A collector runs at startup and hourly, removing artifacts seven days after a task becomes `done` or `cancelled`, along with old files that no longer have database records. Back up the database and artifact directory together.
+Uploads are limited to 1 GiB. A collector runs at startup and hourly, removing artifacts seven days after a task becomes `done` or `cancelled`, along with old files that no longer have database records. Back up the whole data directory to keep the database and artifacts together.
 
 When `ORCIS_TOKEN` is set, send `Authorization: Bearer …` on every request except `GET /healthz`, `GET /docs.md`, and `GET /ui`. This includes the discovery index and other methods on those paths.
 
