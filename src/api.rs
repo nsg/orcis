@@ -1,25 +1,33 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::{
+    io,
+    path::Path as StdPath,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use axum::{
     Json as AxumJson, Router,
+    body::Body,
     extract::{
         FromRequest, FromRequestParts, OptionalFromRequest, Path, Query, Request, State,
         rejection::JsonRejection,
     },
-    http::{Method, StatusCode, request::Parts},
+    http::{HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use serde::{Serialize, de::DeserializeOwned};
+use jiff::Timestamp;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
+    artifact::{ArtifactFiles, MAX_ARTIFACT_BYTES, UploadError},
     model::{
-        AgentRequest, ClaimNextRequest, CreateTask, EmptyRequest, Label, PatchTask, ResultRequest,
-        SetLabelDescription, Status, TaskView,
+        AgentRequest, Artifact, ClaimNextRequest, CreateTask, EmptyRequest, Label, PatchTask,
+        ResultRequest, SetLabelDescription, Status, TaskView,
     },
     store::{Store, StoreError},
 };
@@ -30,15 +38,45 @@ const BOARD_UI: &str = include_str!("ui/index.html");
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
+    artifact_files: Arc<ArtifactFiles>,
     expected_authorization: Option<String>,
 }
 
 impl AppState {
     pub fn new(store: Store, token: Option<String>) -> Self {
-        Self {
+        Self::with_artifact_dir(store, token, "orcis.db.artifacts")
+            .expect("default artifact directory opens")
+    }
+
+    pub fn with_artifact_dir(
+        store: Store,
+        token: Option<String>,
+        artifact_dir: impl AsRef<StdPath>,
+    ) -> io::Result<Self> {
+        Ok(Self {
             store: Arc::new(Mutex::new(store)),
+            artifact_files: Arc::new(ArtifactFiles::open(artifact_dir.as_ref())?),
             expected_authorization: token.map(|token| format!("Bearer {token}")),
+        })
+    }
+
+    pub fn collect_expired_artifacts(&self, cutoff: Timestamp) -> Result<(usize, usize), String> {
+        let expired = lock(self)
+            .take_expired_artifacts(cutoff)
+            .map_err(|error| format!("failed to select expired artifacts: {error:?}"))?;
+        for artifact in &expired {
+            if let Err(error) = self.artifact_files.remove(artifact.id) {
+                warn!(artifact = %artifact.id, %error, "failed to remove expired artifact file");
+            }
         }
+        let tracked = lock(self)
+            .artifact_ids()
+            .map_err(|error| format!("failed to list artifact records: {error:?}"))?;
+        let orphans = self
+            .artifact_files
+            .remove_untracked(&tracked, Duration::from_secs(60 * 60))
+            .map_err(|error| format!("failed to remove orphan artifact files: {error}"))?;
+        Ok((expired.len(), orphans))
     }
 }
 
@@ -113,6 +151,39 @@ impl ApiError {
         }
     }
 
+    fn payload_too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!("artifact must be at most {} bytes", MAX_ARTIFACT_BYTES),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        let message = message.into();
+        error!(%message, "internal artifact error");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "internal error".to_owned(),
+        }
+    }
+
+    fn from_upload_error(error: UploadError) -> Self {
+        match error {
+            UploadError::TooLarge => Self::payload_too_large(),
+            UploadError::Body(error) => {
+                Self::bad_request(format!("failed to read artifact body: {error}"))
+            }
+            UploadError::Io(error) => Self::internal(format!("failed to store artifact: {error}")),
+        }
+    }
+
+    fn from_artifact_store_error(error: StoreError) -> Self {
+        match error {
+            StoreError::NotFound => Self::not_found("artifact not found"),
+            error => error.into(),
+        }
+    }
+
     fn from_json_rejection(rejection: JsonRejection) -> Self {
         let status = match rejection.status() {
             StatusCode::UNPROCESSABLE_ENTITY => StatusCode::BAD_REQUEST,
@@ -180,6 +251,76 @@ struct LabelList {
     labels: Vec<Label>,
 }
 
+#[derive(Serialize)]
+struct ArtifactList {
+    artifacts: Vec<Artifact>,
+}
+
+struct UploadArtifact {
+    filename: String,
+    agent: String,
+}
+
+impl UploadArtifact {
+    fn parse(parameters: Vec<(String, String)>) -> Result<Self, ApiError> {
+        let mut filename = None;
+        let mut agent = None;
+        for (name, value) in parameters {
+            let destination = match name.as_str() {
+                "filename" => &mut filename,
+                "agent" => &mut agent,
+                _ => {
+                    return Err(ApiError::bad_request(format!(
+                        "unknown query field: {name}"
+                    )));
+                }
+            };
+            if destination.replace(value).is_some() {
+                return Err(ApiError::bad_request(format!(
+                    "duplicate query field: {name}"
+                )));
+            }
+        }
+        Ok(Self {
+            filename: filename
+                .ok_or_else(|| ApiError::bad_request("missing query field: filename"))?,
+            agent: agent.ok_or_else(|| ApiError::bad_request("missing query field: agent"))?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ArtifactPath {
+    id: String,
+    artifact_id: String,
+}
+
+struct TaskArtifactIds {
+    task_id: Uuid,
+    artifact_id: Uuid,
+}
+
+impl<S> FromRequestParts<S> for TaskArtifactIds
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(path) = Path::<ArtifactPath>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| ApiError::not_found("artifact not found"))?;
+        let task_id =
+            Uuid::parse_str(&path.id).map_err(|_| ApiError::not_found("artifact not found"))?;
+        let artifact_id = Uuid::parse_str(&path.artifact_id)
+            .map_err(|_| ApiError::not_found("artifact not found"))?;
+        Ok(Self {
+            task_id,
+            artifact_id,
+        })
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -198,6 +339,14 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{id}/fail", post(fail_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/tasks/{id}/retry", post(retry_task))
+        .route(
+            "/tasks/{id}/artifacts",
+            post(upload_artifact).get(list_artifacts),
+        )
+        .route(
+            "/tasks/{id}/artifacts/{artifact_id}",
+            get(download_artifact).delete(delete_artifact),
+        )
         .route("/labels", get(list_labels))
         .route("/labels/{name}", put(set_label_description))
         .fallback(fallback)
@@ -265,6 +414,22 @@ async fn index() -> AxumJson<Index> {
                 "POST",
                 "/tasks/{id}/retry",
                 "Retry a failed or cancelled task.",
+            ),
+            endpoint(
+                "POST",
+                "/tasks/{id}/artifacts",
+                "Upload an artifact for a claimed task.",
+            ),
+            endpoint("GET", "/tasks/{id}/artifacts", "List a task's artifacts."),
+            endpoint(
+                "GET",
+                "/tasks/{id}/artifacts/{artifact_id}",
+                "Download an artifact.",
+            ),
+            endpoint(
+                "DELETE",
+                "/tasks/{id}/artifacts/{artifact_id}",
+                "Delete an artifact.",
             ),
             endpoint(
                 "GET",
@@ -419,6 +584,127 @@ async fn retry_task(
     Ok(AxumJson(lock(&state).retry(id)?))
 }
 
+async fn upload_artifact(
+    State(state): State<AppState>,
+    TaskId(task_id): TaskId,
+    Query(parameters): Query<Vec<(String, String)>>,
+    request: Request,
+) -> Result<impl IntoResponse, ApiError> {
+    let upload = UploadArtifact::parse(parameters)?;
+    if let Some(value) = request.headers().get(header::CONTENT_LENGTH) {
+        let size = value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| ApiError::bad_request("invalid content length"))?;
+        if size > MAX_ARTIFACT_BYTES as u64 {
+            return Err(ApiError::payload_too_large());
+        }
+    }
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| ApiError::bad_request("invalid artifact content type"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    lock(&state).validate_artifact_upload(
+        task_id,
+        &upload.agent,
+        &upload.filename,
+        &content_type,
+    )?;
+
+    let id = Uuid::new_v4();
+    let size_bytes = state
+        .artifact_files
+        .write_body(id, request.into_body())
+        .await
+        .map_err(ApiError::from_upload_error)?;
+    let artifact = lock(&state).add_artifact(
+        &upload.agent,
+        Artifact {
+            id,
+            task_id,
+            filename: upload.filename,
+            content_type,
+            size_bytes,
+            created_at: Timestamp::now(),
+        },
+    );
+    match artifact {
+        Ok(artifact) => Ok((StatusCode::CREATED, AxumJson(artifact))),
+        Err(error) => {
+            if let Err(remove_error) = state.artifact_files.remove_async(id).await {
+                warn!(artifact = %id, error = %remove_error, "failed to remove rejected artifact upload");
+            }
+            Err(error.into())
+        }
+    }
+}
+
+async fn list_artifacts(
+    State(state): State<AppState>,
+    TaskId(task_id): TaskId,
+) -> Result<AxumJson<ArtifactList>, ApiError> {
+    Ok(AxumJson(ArtifactList {
+        artifacts: lock(&state).artifacts(task_id)?,
+    }))
+}
+
+async fn download_artifact(
+    State(state): State<AppState>,
+    ids: TaskArtifactIds,
+) -> Result<Response, ApiError> {
+    let artifact = lock(&state)
+        .artifact(ids.task_id, ids.artifact_id)
+        .map_err(ApiError::from_artifact_store_error)?;
+    let body = state
+        .artifact_files
+        .body(artifact.id, artifact.size_bytes)
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to read artifact file: {error}")))?;
+    let mut response = Body::new(body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&artifact.content_type)
+            .map_err(|_| ApiError::internal("invalid stored artifact content type"))?,
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&artifact.size_bytes.to_string())
+            .expect("artifact size is a valid header value"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition(&artifact.filename))
+            .expect("sanitized artifact filename is a valid header value"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
+}
+
+async fn delete_artifact(
+    State(state): State<AppState>,
+    ids: TaskArtifactIds,
+) -> Result<StatusCode, ApiError> {
+    let artifact = lock(&state)
+        .delete_artifact(ids.task_id, ids.artifact_id)
+        .map_err(ApiError::from_artifact_store_error)?;
+    if let Err(error) = state.artifact_files.remove_async(artifact.id).await {
+        warn!(artifact = %artifact.id, %error, "failed to remove deleted artifact file");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_labels(State(state): State<AppState>) -> Result<AxumJson<LabelList>, ApiError> {
     Ok(AxumJson(LabelList {
         labels: lock(&state).labels()?,
@@ -457,6 +743,25 @@ fn lock(state: &AppState) -> MutexGuard<'_, Store> {
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn content_disposition(filename: &str) -> String {
+    let filename: String = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let filename = if filename.trim().is_empty() {
+        "artifact"
+    } else {
+        &filename
+    };
+    format!("attachment; filename=\"{filename}\"")
 }
 
 #[derive(Default)]

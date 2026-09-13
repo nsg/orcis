@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, ffi::OsString, net::SocketAddr, path::PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -30,6 +30,12 @@ impl Config {
             rust_log: get("RUST_LOG").unwrap_or_else(|| "info".to_owned()),
         })
     }
+
+    pub fn artifact_dir(&self) -> PathBuf {
+        let mut path = OsString::from(&self.db_path);
+        path.push(".artifacts");
+        PathBuf::from(path)
+    }
 }
 
 #[cfg(test)]
@@ -41,6 +47,7 @@ mod tests {
         let config = Config::from_map(&HashMap::new()).expect("defaults are valid");
         assert_eq!(config.addr, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(config.db_path, "orcis.db");
+        assert_eq!(config.artifact_dir(), PathBuf::from("orcis.db.artifacts"));
         assert_eq!(config.rust_log, "info");
 
         let values = HashMap::from([
@@ -52,6 +59,10 @@ mod tests {
         let config = Config::from_map(&values).expect("overrides are valid");
         assert_eq!(config.addr, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(config.db_path, "/tmp/orcis.db");
+        assert_eq!(
+            config.artifact_dir(),
+            PathBuf::from("/tmp/orcis.db.artifacts")
+        );
         assert_eq!(config.token.as_deref(), Some("secret"));
         assert_eq!(config.rust_log, "debug");
     }

@@ -22,7 +22,7 @@ Run it as a single static binary configured through environment variables, and o
 - Model dependency graphs and reject missing, self-referential, or cyclic edges.
 - Filter tasks by status, readiness, requirements, and claiming agent.
 - Enforce task-state transitions and ownership of active work.
-- Attach arbitrary JSON metadata and completion or failure results.
+- Attach arbitrary JSON metadata, completion or failure results, and binary artifacts up to 100 MiB.
 - Persist the board in a single SQLite file with WAL and transactional claims.
 - Discover every route through the JSON index at `GET /` and read the complete agent documentation at `GET /docs.md`.
 - Watch the board in a browser at `/ui`: a read-only view that polls the API and never writes.
@@ -46,8 +46,9 @@ A typical agent loop is:
 1. Poll `POST /tasks/claim` with the agent identifier and capabilities.
 2. Treat `204 No Content` as no compatible ready work.
 3. Perform the returned task when the response is `200 OK`.
-4. Call `complete` with the same agent and an optional `result`.
-5. Call `fail` with a result on terminal failure, or `release` to return unfinished work to the pool.
+4. Upload any output files while the task is still claimed, then mention their artifact IDs in `result`.
+5. Call `complete` with the same agent and an optional `result`.
+6. Call `fail` with a result on terminal failure, or `release` to return unfinished work to the pool.
 
 ## Quick start
 
@@ -75,7 +76,7 @@ docker run --rm -p 8080:8080 \
   ghcr.io/nsg/orcis:latest
 ```
 
-The mounted volume must be writable by uid `65534`, the non-root user in the image.
+The mounted volume stores both `orcis.db` and `orcis.db.artifacts`, and must be writable by uid `65534`, the non-root user in the image.
 
 ### Watch the board
 
@@ -143,11 +144,13 @@ blocked.
 
 Every mutation is one SQLite transaction (`BEGIN IMMEDIATE`). The database uses WAL journal mode, and its schema is created and migrated automatically with `PRAGMA user_version`. Failure to open the database stops startup. A failed write returns `500 Internal Server Error` and leaves the board unchanged.
 
+Artifacts are stored in a sibling directory formed by appending `.artifacts` to `ORCIS_DB_PATH`. Uploads are limited to 100 MiB. A collector runs at startup and hourly, removing artifacts seven days after a task becomes `done` or `cancelled`, along with old files that no longer have database records. Back up the database and artifact directory together.
+
 When `ORCIS_TOKEN` is set, send `Authorization: Bearer …` on every request except `GET /healthz`, `GET /docs.md`, and `GET /ui`. This includes the discovery index and other methods on those paths.
 
 ## API reference
 
-All request bodies shown below use `Content-Type: application/json`. Successful task operations return the task object unless noted otherwise.
+JSON request bodies shown below use `Content-Type: application/json`. Artifact uploads and downloads use raw bytes. Successful task operations return the task object unless noted otherwise.
 
 | Method | Path | Purpose | Success code |
 |---|---|---|---|
@@ -167,6 +170,10 @@ All request bodies shown below use `Content-Type: application/json`. Successful 
 | `POST` | `/tasks/{id}/fail` | Mark owned work `failed`. | `200` |
 | `POST` | `/tasks/{id}/cancel` | Cancel eligible work. | `200` |
 | `POST` | `/tasks/{id}/retry` | Return failed or cancelled work to `todo`. | `200` |
+| `POST` | `/tasks/{id}/artifacts` | Upload an artifact for an owned task. | `201` |
+| `GET` | `/tasks/{id}/artifacts` | List a task's artifacts. | `200` |
+| `GET` | `/tasks/{id}/artifacts/{artifact_id}` | Download an artifact. | `200` |
+| `DELETE` | `/tasks/{id}/artifacts/{artifact_id}` | Delete an artifact. | `204` |
 | `GET` | `/labels` | List labels in use on open tasks. | `200` |
 | `PUT` | `/labels/{name}` | Set a label description on open tasks. | `200` |
 
@@ -279,6 +286,34 @@ Use these request body shapes for claim/release, complete/fail, and cancel/retry
 
 The claim, release, complete, and fail bodies require `agent`. Release, complete, and fail require that agent to match `claimed_by`; claim establishes ownership. Complete and fail retain `claimed_by`. An omitted `result` is stored as `null`. Invalid transitions and ownership mismatches return `409 Conflict`.
 
+### Artifacts
+
+Upload a file before completing the claimed task. The request body is the file itself, and `Content-Type` is saved with it:
+
+```bash
+curl -sS -X POST \
+  "http://127.0.0.1:8080/tasks/$TASK_ID/artifacts?filename=report.zip&agent=agent-1" \
+  -H 'Content-Type: application/zip' \
+  --data-binary @report.zip
+```
+
+The response is `201 Created` with metadata:
+
+```json
+{
+  "id": "1e9bc219-ac55-4f80-aeec-cfc33cdd6a9b",
+  "task_id": "93f6654d-db35-49ba-8030-caa595d70370",
+  "filename": "report.zip",
+  "content_type": "application/zip",
+  "size_bytes": 1048576,
+  "created_at": "2026-09-13T12:00:00Z"
+}
+```
+
+Only the agent that owns an `in_progress` task may upload to it. The streamed body may be empty and must not exceed 100 MiB. Upload every artifact before calling `complete`, then put its ID in the task result when that helps the receiving agent.
+
+`GET /tasks/{id}/artifacts` returns `{"artifacts": [...]}`. Download the raw bytes with `GET /tasks/{id}/artifacts/{artifact_id}`; the response includes the stored content type, content length, and an attachment filename. `DELETE` on the same path removes the artifact immediately and returns `204 No Content`.
+
 ### Claim from the pool
 
 Send `POST /tasks/claim`:
@@ -319,10 +354,10 @@ Every API error is JSON with one field:
 |---|---|
 | `400 Bad Request` | JSON is malformed or has the wrong shape; a field, query, title, dependency, or UUID body value is invalid; or a request contains an unknown field. |
 | `401 Unauthorized` | A configured bearer token is absent or incorrect. |
-| `404 Not Found` | A route or task does not exist, or a task UUID in the path is malformed. |
+| `404 Not Found` | A route, task, or artifact does not exist, or a UUID in the path is malformed. |
 | `405 Method Not Allowed` | A known route does not support the requested method. |
 | `409 Conflict` | A transition, ownership, readiness, deletion, or dependency-cycle rule is violated. |
-| `413 Payload Too Large` | A JSON request exceeds axum's 2 MiB default body limit. |
+| `413 Payload Too Large` | A JSON request exceeds 2 MiB or an artifact exceeds 100 MiB. |
 | `415 Unsupported Media Type` | A required or present JSON body does not have a JSON content type. |
 | `500 Internal Server Error` | A database operation fails. The transaction is rolled back. |
 

@@ -53,6 +53,16 @@ pub struct Label {
     pub ready_tasks: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Artifact {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub created_at: Timestamp,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetLabelDescription {

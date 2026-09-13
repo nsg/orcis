@@ -9,6 +9,7 @@ use orcis::{
     store::Store,
 };
 use serde_json::{Value, json};
+use tempfile::tempdir;
 use tower::ServiceExt;
 
 fn app(token: Option<&str>) -> Router {
@@ -976,4 +977,125 @@ async fn task_list_sorts_by_priority_created_at_and_id() {
     assert_eq!(actual, expected);
     assert_eq!(body["tasks"][0]["title"], "high old");
     assert_eq!(body["tasks"][1]["title"], "high new");
+}
+
+#[tokio::test]
+async fn artifact_upload_list_download_delete_and_limits() {
+    let directory = tempdir().unwrap();
+    let app =
+        router(AppState::with_artifact_dir(Store::in_memory(), None, directory.path()).unwrap());
+    let task = create_task(&app, json!({"title": "produce an artifact"})).await;
+    let task_id = task["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/tasks/{task_id}/claim"),
+            json!({"agent": "worker"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/tasks/{task_id}/artifacts?filename=report.txt&agent=worker"
+                ))
+                .header(header::CONTENT_LENGTH, 100 * 1024 * 1024 + 1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/tasks/{task_id}/artifacts?filename=report.txt&agent=worker"
+                ))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("artifact contents"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let artifact = body_json(response).await;
+    assert_eq!(artifact["filename"], "report.txt");
+    assert_eq!(artifact["content_type"], "text/plain");
+    assert_eq!(artifact["size_bytes"], 17);
+    let artifact_id = artifact["id"].as_str().unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(get(&format!("/tasks/{task_id}/artifacts")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["artifacts"][0], artifact);
+
+    let response = app
+        .clone()
+        .oneshot(get(&format!("/tasks/{task_id}/artifacts/{artifact_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+    assert_eq!(response.headers()[header::CONTENT_LENGTH], "17");
+    assert_eq!(body_text(response).await, "artifact contents");
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/tasks/{task_id}/complete"),
+            json!({"agent": "worker", "result": {"artifact_id": artifact_id}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/tasks/{task_id}/artifacts?filename=late.txt&agent=worker"
+                ))
+                .body(Body::from("late"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/tasks/{task_id}/artifacts/{artifact_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = app
+        .oneshot(get(&format!("/tasks/{task_id}/artifacts/{artifact_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(response).await,
+        json!({"error": "artifact not found"})
+    );
 }

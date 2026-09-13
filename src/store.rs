@@ -8,7 +8,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    CreateTask, Label, Patch, PatchTask, Requirement, RequirementInput, Status, Task, TaskView,
+    Artifact, CreateTask, Label, Patch, PatchTask, Requirement, RequirementInput, Status, Task,
+    TaskView,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -48,6 +49,22 @@ CREATE INDEX task_requirements_name ON task_requirements(name);
 INSERT INTO task_requirements (task_id, name, description, position)
   SELECT tasks.id, je.value, NULL, je.key FROM tasks, json_each(tasks.requires) AS je;
 ALTER TABLE tasks DROP COLUMN requires;
+"#,
+    r#"
+ALTER TABLE tasks ADD COLUMN closed_at TEXT;
+UPDATE tasks
+SET closed_at = updated_at
+WHERE status IN ('done', 'cancelled');
+CREATE INDEX tasks_closed_at ON tasks(closed_at) WHERE closed_at IS NOT NULL;
+CREATE TABLE artifacts (
+  id           TEXT PRIMARY KEY,
+  task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  filename     TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  size_bytes   INTEGER NOT NULL CHECK (size_bytes >= 0),
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX artifacts_task_id ON artifacts(task_id, created_at, id);
 "#,
 ];
 
@@ -299,6 +316,139 @@ impl Store {
         Ok(())
     }
 
+    pub fn add_artifact(
+        &mut self,
+        agent: &str,
+        mut artifact: Artifact,
+    ) -> Result<Artifact, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_artifact_upload(
+            &tx,
+            artifact.task_id,
+            agent,
+            &artifact.filename,
+            &artifact.content_type,
+        )?;
+        artifact.filename = artifact.filename.trim().to_owned();
+        tx.execute(
+            "INSERT INTO artifacts (
+               id, task_id, filename, content_type, size_bytes, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                artifact.id.to_string(),
+                artifact.task_id.to_string(),
+                artifact.filename,
+                artifact.content_type,
+                sql_integer(artifact.size_bytes, "artifact size")?,
+                format!("{:.9}", artifact.created_at),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(artifact)
+    }
+
+    pub fn validate_artifact_upload(
+        &self,
+        task_id: Uuid,
+        agent: &str,
+        filename: &str,
+        content_type: &str,
+    ) -> Result<(), StoreError> {
+        validate_artifact_upload(&self.conn, task_id, agent, filename, content_type)
+    }
+
+    pub fn artifacts(&self, task_id: Uuid) -> Result<Vec<Artifact>, StoreError> {
+        read_task(&self.conn, task_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT id, task_id, filename, content_type, size_bytes, created_at
+             FROM artifacts
+             WHERE task_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        statement
+            .query_map([task_id.to_string()], decode_artifact)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn artifact(&self, task_id: Uuid, id: Uuid) -> Result<Artifact, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, task_id, filename, content_type, size_bytes, created_at
+                 FROM artifacts
+                 WHERE task_id = ?1 AND id = ?2",
+                params![task_id.to_string(), id.to_string()],
+                decode_artifact,
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    pub fn delete_artifact(&mut self, task_id: Uuid, id: Uuid) -> Result<Artifact, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let artifact = tx
+            .query_row(
+                "SELECT id, task_id, filename, content_type, size_bytes, created_at
+                 FROM artifacts
+                 WHERE task_id = ?1 AND id = ?2",
+                params![task_id.to_string(), id.to_string()],
+                decode_artifact,
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        tx.execute("DELETE FROM artifacts WHERE id = ?1", [id.to_string()])?;
+        tx.commit()?;
+        Ok(artifact)
+    }
+
+    pub fn take_expired_artifacts(
+        &mut self,
+        cutoff: Timestamp,
+    ) -> Result<Vec<Artifact>, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cutoff = format!("{cutoff:.9}");
+        let artifacts = {
+            let mut statement = tx.prepare(
+                "SELECT a.id, a.task_id, a.filename, a.content_type, a.size_bytes, a.created_at
+                 FROM artifacts a
+                 JOIN tasks t ON t.id = a.task_id
+                 WHERE t.status IN ('done', 'cancelled')
+                   AND t.closed_at <= ?1
+                 ORDER BY a.id",
+            )?;
+            statement
+                .query_map([&cutoff], decode_artifact)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
+            "DELETE FROM artifacts
+             WHERE id IN (
+               SELECT a.id
+               FROM artifacts a
+               JOIN tasks t ON t.id = a.task_id
+               WHERE t.status IN ('done', 'cancelled')
+                 AND t.closed_at <= ?1
+             )",
+            [&cutoff],
+        )?;
+        tx.commit()?;
+        Ok(artifacts)
+    }
+
+    pub fn artifact_ids(&self) -> Result<HashSet<Uuid>, StoreError> {
+        let mut statement = self.conn.prepare("SELECT id FROM artifacts")?;
+        statement
+            .query_map([], |row| parse_uuid(0, &row.get::<_, String>(0)?))?
+            .collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn claim(&mut self, id: Uuid, agent: String) -> Result<TaskView, StoreError> {
         let tx = self
             .conn
@@ -390,6 +540,7 @@ impl Store {
         task.claimed_by = None;
         touch(&mut task);
         update_task(&tx, &task)?;
+        set_closed_at(&tx, task.id, Some(task.updated_at))?;
         let view = view(&tx, task)?;
         tx.commit()?;
         Ok(view)
@@ -408,6 +559,7 @@ impl Store {
         task.result = None;
         touch(&mut task);
         update_task(&tx, &task)?;
+        set_closed_at(&tx, task.id, None)?;
         let view = view(&tx, task)?;
         tx.commit()?;
         Ok(view)
@@ -440,6 +592,9 @@ impl Store {
         }
         touch(&mut task);
         update_task(&tx, &task)?;
+        if matches!(action, OwnedAction::Complete) {
+            set_closed_at(&tx, task.id, Some(task.updated_at))?;
+        }
         let view = view(&tx, task)?;
         tx.commit()?;
         Ok(view)
@@ -506,6 +661,21 @@ fn update_task(conn: &Connection, task: &Task) -> Result<(), StoreError> {
             task.claimed_by,
             result,
             format!("{:.9}", task.updated_at),
+        ],
+    )?;
+    Ok(())
+}
+
+fn set_closed_at(
+    conn: &Connection,
+    id: Uuid,
+    closed_at: Option<Timestamp>,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE tasks SET closed_at = ?2 WHERE id = ?1",
+        params![
+            id.to_string(),
+            closed_at.map(|timestamp| format!("{timestamp:.9}"))
         ],
     )?;
     Ok(())
@@ -597,6 +767,23 @@ fn decode_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         version: version
             .try_into()
             .map_err(|error| conversion_error(10, Type::Integer, error))?,
+    })
+}
+
+fn decode_artifact(row: &Row<'_>) -> rusqlite::Result<Artifact> {
+    let id: String = row.get(0)?;
+    let task_id: String = row.get(1)?;
+    let size_bytes: i64 = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    Ok(Artifact {
+        id: parse_uuid(0, &id)?,
+        task_id: parse_uuid(1, &task_id)?,
+        filename: row.get(2)?,
+        content_type: row.get(3)?,
+        size_bytes: size_bytes
+            .try_into()
+            .map_err(|error| conversion_error(4, Type::Integer, error))?,
+        created_at: parse_timestamp(5, &created_at)?,
     })
 }
 
@@ -914,6 +1101,66 @@ fn validate_title(title: &str) -> Result<(), StoreError> {
     if title.chars().count() > 500 {
         return Err(StoreError::Invalid(
             "title must be at most 500 characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_filename(filename: &str) -> Result<(), StoreError> {
+    if filename.is_empty() {
+        return Err(StoreError::Invalid(
+            "artifact filename must not be empty".to_owned(),
+        ));
+    }
+    if filename.chars().count() > 255 {
+        return Err(StoreError::Invalid(
+            "artifact filename must be at most 255 characters".to_owned(),
+        ));
+    }
+    if filename.chars().any(char::is_control) {
+        return Err(StoreError::Invalid(
+            "artifact filename must not contain control characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_owner(
+    conn: &Connection,
+    task_id: Uuid,
+    agent: &str,
+) -> Result<(), StoreError> {
+    let task = read_task(conn, task_id)?;
+    if task.status != Status::InProgress {
+        return Err(StoreError::Conflict(format!(
+            "cannot add an artifact to a task in status {}",
+            status_text(task.status)
+        )));
+    }
+    if task.claimed_by.as_deref() != Some(agent) {
+        return Err(StoreError::Conflict(format!(
+            "task is not claimed by agent {agent}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_upload(
+    conn: &Connection,
+    task_id: Uuid,
+    agent: &str,
+    filename: &str,
+    content_type: &str,
+) -> Result<(), StoreError> {
+    validate_artifact_owner(conn, task_id, agent)?;
+    validate_artifact_filename(filename.trim())?;
+    validate_content_type(content_type)
+}
+
+fn validate_content_type(content_type: &str) -> Result<(), StoreError> {
+    if content_type.is_empty() || content_type.len() > 255 {
+        return Err(StoreError::Invalid(
+            "artifact content type must contain 1 through 255 bytes".to_owned(),
         ));
     }
     Ok(())
@@ -1450,6 +1697,106 @@ mod tests {
     }
 
     #[test]
+    fn artifacts_require_ownership_and_expire_only_with_closed_tasks() {
+        let mut store = Store::in_memory();
+        let done = create(&mut store, "done");
+        let failed = create(&mut store, "failed");
+        let cancelled = create(&mut store, "cancelled");
+
+        assert!(matches!(
+            store.add_artifact(
+                "agent",
+                Artifact {
+                    id: Uuid::new_v4(),
+                    task_id: done,
+                    filename: "before.txt".to_owned(),
+                    content_type: "text/plain".to_owned(),
+                    size_bytes: 1,
+                    created_at: Timestamp::now(),
+                },
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let mut artifacts = Vec::new();
+        for task_id in [done, failed, cancelled] {
+            store.claim(task_id, "agent".to_owned()).unwrap();
+            let artifact = store
+                .add_artifact(
+                    "agent",
+                    Artifact {
+                        id: Uuid::new_v4(),
+                        task_id,
+                        filename: format!("{task_id}.bin"),
+                        content_type: "application/octet-stream".to_owned(),
+                        size_bytes: 42,
+                        created_at: Timestamp::now(),
+                    },
+                )
+                .unwrap();
+            artifacts.push(artifact);
+        }
+        store.complete(done, "agent", None).unwrap();
+        store.fail(failed, "agent", None).unwrap();
+        store.cancel(cancelled).unwrap();
+
+        let cutoff = Timestamp::from_second(Timestamp::now().as_second() + 1).unwrap();
+        let expired = store.take_expired_artifacts(cutoff).unwrap();
+        assert_eq!(
+            expired
+                .iter()
+                .map(|artifact| artifact.task_id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([done, cancelled])
+        );
+        assert!(store.artifacts(done).unwrap().is_empty());
+        assert_eq!(store.artifacts(failed).unwrap(), vec![artifacts[1].clone()]);
+        assert!(store.artifacts(cancelled).unwrap().is_empty());
+    }
+
+    #[test]
+    fn artifact_retention_uses_the_closure_time() {
+        let mut store = Store::in_memory();
+        let task_id = create(&mut store, "closed");
+        store.claim(task_id, "agent".to_owned()).unwrap();
+        let artifact = Artifact {
+            id: Uuid::new_v4(),
+            task_id,
+            filename: "result.bin".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            size_bytes: 1,
+            created_at: Timestamp::now(),
+        };
+        store.add_artifact("agent", artifact.clone()).unwrap();
+        store.complete(task_id, "agent", None).unwrap();
+        let closed_at: String = store
+            .conn
+            .query_row(
+                "SELECT closed_at FROM tasks WHERE id = ?1",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        store.patch(task_id, PatchTask::default()).unwrap();
+        let closed_after_patch: String = store
+            .conn
+            .query_row(
+                "SELECT closed_at FROM tasks WHERE id = ?1",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(closed_after_patch, closed_at);
+        assert_eq!(
+            store
+                .take_expired_artifacts(closed_at.parse().unwrap())
+                .unwrap(),
+            vec![artifact]
+        );
+    }
+
+    #[test]
     fn reopen_round_trip_preserves_tasks_and_dependencies() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("orcis.db");
@@ -1469,7 +1816,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let tasks = reopened.list().unwrap();
         assert_eq!(tasks.len(), 2);
         let reopened_a = tasks.iter().find(|task| task.task.id == a).unwrap();
@@ -1491,7 +1838,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -1520,7 +1867,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let rows = requirement_rows(&store.conn, id).unwrap();
         assert_eq!(
             rows,

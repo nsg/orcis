@@ -1,5 +1,6 @@
 use std::{io::IsTerminal, process::ExitCode};
 
+use jiff::Timestamp;
 use orcis::{
     api::{AppState, router},
     config::Config,
@@ -31,14 +32,18 @@ async fn run() -> Result<(), String> {
 
     let store = Store::open(&config.db_path)
         .map_err(|error| format!("failed to open ORCIS_DB_PATH {:?}: {error}", config.db_path))?;
-    let app = router(AppState::new(store, config.token));
+    let artifact_dir = config.artifact_dir();
+    let state = AppState::with_artifact_dir(store, config.token, &artifact_dir)
+        .map_err(|error| format!("failed to open artifact directory {artifact_dir:?}: {error}"))?;
+    spawn_artifact_collector(state.clone());
+    let app = router(state);
     let listener = TcpListener::bind(config.addr)
         .await
         .map_err(|error| format!("failed to bind ORCIS_ADDR {:?}: {error}", config.addr))?;
     let bound = listener
         .local_addr()
         .map_err(|error| format!("failed to inspect bound address: {error}"))?;
-    info!(address = %bound, database = %config.db_path, "orcis listening");
+    info!(address = %bound, database = %config.db_path, artifacts = %artifact_dir.display(), "orcis listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -46,6 +51,30 @@ async fn run() -> Result<(), String> {
         .map_err(|error| format!("server error: {error}"))?;
     info!("orcis shutdown complete");
     Ok(())
+}
+
+fn spawn_artifact_collector(state: AppState) {
+    const RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+    const INTERVAL_SECONDS: u64 = 60 * 60;
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(INTERVAL_SECONDS));
+        loop {
+            interval.tick().await;
+            let cutoff = Timestamp::from_second(Timestamp::now().as_second() - RETENTION_SECONDS)
+                .expect("seven days before the current timestamp is representable");
+            let state = state.clone();
+            match tokio::task::spawn_blocking(move || state.collect_expired_artifacts(cutoff)).await
+            {
+                Ok(Ok((expired, orphans))) if expired > 0 || orphans > 0 => {
+                    info!(expired, orphans, "collected artifact files");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => warn!(%error, "artifact collection failed"),
+                Err(error) => warn!(%error, "artifact collector task failed"),
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {
