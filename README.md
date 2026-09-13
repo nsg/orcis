@@ -21,7 +21,6 @@ Run it as a single static binary configured through environment variables, and o
 - Enforce task-state transitions and ownership of active work.
 - Attach arbitrary JSON metadata and completion or failure results.
 - Persist the board in a single SQLite file with WAL and transactional claims.
-- Run with an in-memory database and no authentication for local coordination.
 - Discover every route through the JSON index at `GET /`.
 
 ## How it works
@@ -132,7 +131,7 @@ blocked.
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `ORCIS_ADDR` | `127.0.0.1:8080` | Socket address on which to listen. The container overrides this with `0.0.0.0:8080`. |
-| `ORCIS_DB_PATH` | `orcis.db` | SQLite database file; created on first start. `:memory:` keeps the board in memory. |
+| `ORCIS_DB_PATH` | `orcis.db` | SQLite database file; created on first start. SQLite's own `:memory:` name gives a throwaway board. |
 | `ORCIS_TOKEN` | unset | Expected bearer token. Disable authentication when unset. |
 | `RUST_LOG` | `info` | `tracing-subscriber` environment-filter directive. |
 

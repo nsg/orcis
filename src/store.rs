@@ -62,14 +62,8 @@ enum OwnedAction {
 
 impl Store {
     pub fn open(path: &str) -> rusqlite::Result<Self> {
-        let mut conn = if path == ":memory:" {
-            Connection::open_in_memory()?
-        } else {
-            Connection::open(path)?
-        };
-        if path != ":memory:" {
-            conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
-        }
+        let mut conn = Connection::open(path)?;
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
