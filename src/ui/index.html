@@ -1,0 +1,915 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>orcis · board</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f4f4f1;
+    --surface: #fcfcfb;
+    --surface-2: #f9f9f7;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --hair: #e1e0d9;
+    --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6;
+    --accent-soft: #e6f0fb;
+    --good: #0ca30c;      --good-text: #006300;    --good-soft: #e5f5e5;
+    --warn: #fab219;      --warn-text: #7a5200;    --warn-soft: #fff4d6;
+    --serious: #ec835a;   --serious-text: #8a3a17; --serious-soft: #fde9e0;
+    --critical: #d03b3b;  --critical-text: #8f1f1f;--critical-soft: #fbe3e3;
+    --neutral: #898781;   --neutral-soft: #ecebe6;
+    --json: #f4f4f1;
+    --hatch: #f8f7f3;
+    --radius: 10px;
+    --shadow: 0 1px 2px rgba(11,11,11,0.05), 0 1px 1px rgba(11,11,11,0.03);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --surface-2: #222221;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --hair: #2c2c2a;
+      --border: rgba(255,255,255,0.10);
+      --accent: #3987e5;
+      --accent-soft: rgba(57,135,229,0.18);
+      --good: #0ca30c;      --good-text: #5fd35f;    --good-soft: rgba(12,163,12,0.18);
+      --warn: #fab219;      --warn-text: #ffd27a;    --warn-soft: rgba(250,178,25,0.16);
+      --serious: #ec835a;   --serious-text: #ffb08f; --serious-soft: rgba(236,131,90,0.18);
+      --critical: #d03b3b;  --critical-text: #ff8a8a;--critical-soft: rgba(208,59,59,0.20);
+      --neutral: #898781;   --neutral-soft: rgba(255,255,255,0.08);
+      --json: #141413;
+      --hatch: #1d1d1c;
+      --shadow: 0 1px 2px rgba(0,0,0,0.20), 0 1px 1px rgba(0,0,0,0.12);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--page); color: var(--ink); font-size: 14px; line-height: 1.4; }
+  button, select, input { font: inherit; }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+  .tabular { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+
+  .topbar {
+    min-height: 56px; display: flex; align-items: center; gap: 20px; padding: 8px 24px;
+    background: var(--surface); border-bottom: 1px solid var(--hair);
+    position: sticky; top: 0; z-index: 5;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 16px; letter-spacing: -0.01em; white-space: nowrap; }
+  .brand .logo { width: 26px; height: 26px; border-radius: 7px; background: var(--ink); display: grid; place-items: center; }
+  .brand .logo svg { stroke: var(--surface); }
+  .brand .host { color: var(--muted); font-weight: 400; font-size: 13px; }
+  .brand .host::before { content: "/"; margin: 0 8px 0 2px; color: var(--hair); }
+  .badge-ro {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+    background: var(--neutral-soft); color: var(--ink-2); font-size: 12px; font-weight: 600;
+    border: 1px solid var(--border); white-space: nowrap;
+  }
+  .spacer { flex: 1; }
+  .refresh { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  .live { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px rgba(12,163,12,0.18); flex: none; }
+  .refresh.disconnected { color: var(--critical-text); }
+  .refresh.disconnected .live { background: var(--critical); box-shadow: 0 0 0 3px var(--critical-soft); }
+  .refresh.connecting .live { background: var(--neutral); box-shadow: 0 0 0 3px var(--neutral-soft); }
+  .filter-row { display: flex; align-items: center; gap: 8px; }
+  .chip-btn, .filter-select, .token-form button {
+    min-height: 30px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--ink-2); font-size: 12.5px;
+  }
+  .chip-btn { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; white-space: nowrap; }
+  .chip-btn.active { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); font-weight: 600; }
+  .select-wrap { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  .filter-select { padding-right: 26px; cursor: pointer; }
+  .token-form { display: none; align-items: center; gap: 7px; color: var(--critical-text); font-size: 12px; white-space: nowrap; }
+  .token-form.visible { display: flex; }
+  .token-form input { width: 150px; min-height: 30px; border: 1px solid var(--border); border-radius: 8px; padding: 5px 9px; background: var(--surface-2); color: var(--ink); }
+  .token-form button { cursor: pointer; color: var(--accent); font-weight: 600; }
+
+  .page { padding: 20px 24px 28px; display: grid; grid-template-columns: minmax(0,1fr) 320px; gap: 20px; }
+  .main { min-width: 0; display: flex; flex-direction: column; gap: 18px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+  .tile {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 16px 12px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px;
+    position: relative; overflow: hidden;
+  }
+  .tile .label { font-size: 12.5px; color: var(--ink-2); display: flex; align-items: center; gap: 7px; }
+  .tile .value { font-size: 30px; font-weight: 600; line-height: 1; letter-spacing: -0.02em; }
+  .tile .sub { font-size: 12px; color: var(--muted); }
+  .tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--tile-color, var(--hair)); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--c); display: inline-block; flex: none; }
+
+  .board { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 14px; align-items: start; }
+  .col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .col-head { display: flex; align-items: center; gap: 8px; padding: 2px 4px; }
+  .col-head h2 { margin: 0; font-size: 13px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-2); }
+  .col-head .count { font-size: 12px; color: var(--muted); background: var(--neutral-soft); border-radius: 999px; padding: 1px 8px; }
+  .col-head .split { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+  .card {
+    width: 100%; appearance: none; text-align: left; color: inherit; cursor: pointer;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 12px 10px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 8px;
+    border-left: 3px solid var(--card-color, var(--hair));
+  }
+  .card:hover { border-color: color-mix(in srgb, var(--card-color) 45%, var(--border)); }
+  .card.selected { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .card.blocked { background: repeating-linear-gradient(135deg, var(--surface) 0 10px, var(--hatch) 10px 11px); }
+  .card.dim { opacity: 0.72; }
+  .card .row { display: flex; align-items: flex-start; gap: 8px; }
+  .card .row .prio { margin-top: 2px; }
+  .card .title { font-weight: 600; font-size: 14px; line-height: 1.3; flex: 1; min-width: 0; }
+  .card .id { color: var(--muted); white-space: nowrap; font-size: 11px; }
+  .prio { font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 5px; flex: none; background: var(--neutral-soft); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .prio.high { background: var(--accent-soft); color: var(--accent); }
+  .labels { display: flex; flex-wrap: wrap; gap: 5px; }
+  .lbl { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--hair); background: var(--surface-2); color: var(--ink-2); }
+  .foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 2px; font-size: 12px; color: var(--muted); }
+  .foot .age { margin-left: auto; white-space: nowrap; }
+  .pill { white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--p-bg); color: var(--p-fg); }
+  .agent { white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--hair); padding: 2px 8px 2px 4px; border-radius: 999px; }
+  .avatar { width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; font-size: 9px; font-weight: 700; color: #fff; flex: none; }
+  .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px rgba(250,178,25,0.22); }
+  .result-preview { font-size: 12px; color: var(--ink-2); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .col-note { font-size: 12px; color: var(--muted); text-align: center; padding: 6px; }
+  button.col-note { appearance: none; border: 0; background: transparent; width: 100%; cursor: pointer; }
+  .divider { border: 0; border-top: 1px dashed var(--hair); margin: 2px 0; }
+  .subhead { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; padding: 0 4px; display: flex; gap: 6px; align-items: center; }
+
+  .side { display: flex; flex-direction: column; gap: 16px; }
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+  .panel-head { padding: 12px 14px; border-bottom: 1px solid var(--hair); display: flex; align-items: center; gap: 8px; }
+  .panel-head h3 { margin: 0; font-size: 13px; font-weight: 650; }
+  .panel-head .hint { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+  .panel-body { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+  .panel-body.compact { gap: 0; padding-top: 4px; padding-bottom: 4px; }
+  .detail-title { font-size: 16px; font-weight: 650; line-height: 1.3; }
+  .detail-badges { display: flex; gap: 8px; align-items: center; }
+  .kv { display: grid; grid-template-columns: 92px 1fr; gap: 6px 10px; font-size: 12.5px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  .dep { width: 100%; display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 6px 8px; border: 1px solid var(--hair); border-radius: 8px; background: var(--surface-2); color: var(--ink); text-align: left; }
+  button.dep { cursor: pointer; }
+  .dep .t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .section-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  pre.json { margin: 0; background: var(--json); border: 1px solid var(--hair); border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.5; overflow: auto; color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .desc { font-size: 13px; color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .lab-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--hair); }
+  .lab-row:last-child { border-bottom: 0; }
+  .lab-row > div { min-width: 0; }
+  .lab-row .name { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+  .lab-row .d { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .lab-row .d.missing { color: var(--serious-text); }
+  .lab-row .n { margin-left: auto; font-size: 12px; color: var(--ink-2); background: var(--neutral-soft); border-radius: 999px; padding: 1px 8px; flex: none; }
+  .agent-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--hair); font-size: 13px; }
+  .agent-row:last-child { border-bottom: 0; }
+  .agent-copy { min-width: 0; }
+  .agent-row .who { font-weight: 600; overflow-wrap: anywhere; }
+  .agent-row .what { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .agent-row .r { margin-left: auto; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .foot-note { font-size: 11.5px; color: var(--muted); text-align: center; padding: 4px 0 0; }
+  .empty { color: var(--muted); font-size: 12.5px; }
+
+  @media (max-width: 1100px) {
+    .page { grid-template-columns: minmax(0,1fr); }
+    .side { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); align-items: start; }
+    .foot-note { grid-column: 1 / -1; }
+    .topbar { flex-wrap: wrap; }
+  }
+  @media (max-width: 900px) {
+    .board { grid-template-columns: repeat(2, minmax(0,1fr)); }
+    .tiles { grid-template-columns: repeat(3, minmax(0,1fr)); }
+    .side { grid-template-columns: minmax(0,1fr); }
+    .filter-row { order: 5; width: 100%; overflow-x: auto; padding-bottom: 2px; }
+  }
+  @media (max-width: 600px) {
+    .page { padding: 16px 14px 24px; }
+    .topbar { padding-left: 14px; padding-right: 14px; gap: 10px; }
+    .brand .host { display: none; }
+    .board { grid-template-columns: minmax(0,1fr); }
+    .tiles { grid-template-columns: repeat(2, minmax(0,1fr)); }
+    .refresh { margin-left: auto; }
+    .token-form { order: 4; width: 100%; flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="1.5" y="1.5" width="4" height="4" rx="1"></rect><rect x="8.5" y="1.5" width="4" height="4" rx="1"></rect><rect x="8.5" y="8.5" width="4" height="4" rx="1"></rect><path d="M5.5 3.5h3M10.5 5.5v3M3.5 5.5v7h5"></path>
+      </svg>
+    </span>
+    orcis <span class="host" id="host"></span>
+  </div>
+  <span class="badge-ro" title="This view never writes to the board">
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="5.5" width="8" height="5.5" rx="1.2"></rect><path d="M4 5.5V4a2 2 0 0 1 4 0v1.5"></path></svg>
+    Read only
+  </span>
+  <span class="spacer"></span>
+  <form class="token-form" id="token-form">
+    <span id="token-message">This board needs a token</span>
+    <input id="token-input" type="password" placeholder="ORCIS_TOKEN" autocomplete="current-password" required>
+    <button type="submit">Use token</button>
+  </form>
+  <div class="filter-row" aria-label="Board filters">
+    <button type="button" class="chip-btn active" data-filter="all">All tasks</button>
+    <button type="button" class="chip-btn" data-filter="ready">Ready</button>
+    <button type="button" class="chip-btn" data-filter="blocked">Blocked</button>
+    <label class="select-wrap">requires:
+      <select class="filter-select" id="requires-filter" aria-label="Filter by required label"></select>
+    </label>
+    <label class="select-wrap">claimed_by:
+      <select class="filter-select" id="agent-filter" aria-label="Filter by claiming agent"></select>
+    </label>
+  </div>
+  <div class="refresh connecting" id="refresh" aria-live="polite"><span class="live"></span><span id="refresh-text">Connecting…</span></div>
+</header>
+
+<div class="page">
+  <main class="main">
+    <section class="tiles" id="tiles" aria-label="Board summary"></section>
+    <section class="board" id="board" aria-label="Tasks by status"></section>
+  </main>
+  <aside class="side">
+    <div class="panel">
+      <div class="panel-head"><h3>Task</h3><span class="hint">selected · read only</span></div>
+      <div class="panel-body" id="task-detail"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>Labels in use</h3><span class="hint">GET /labels</span></div>
+      <div class="panel-body compact" id="labels-panel"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>Agents</h3><span class="hint">from claimed_by</span></div>
+      <div class="panel-body compact" id="agents-panel"></div>
+    </div>
+    <div class="foot-note" id="footer"></div>
+  </aside>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  const state = {
+    tasks: [],
+    labels: [],
+    version: null,
+    selectedId: null,
+    showAllDone: false,
+    statusFilter: 'all',
+    requirementFilter: 'any',
+    agentFilter: 'any',
+    token: sessionStorage.getItem('orcis.token'),
+    lastRefresh: null,
+    connected: false,
+    loading: false,
+    pollTimer: null,
+    indexAttempted: false
+  };
+
+  const colors = {
+    ready: ['var(--accent)', 'var(--accent-soft)', 'var(--accent)'],
+    blocked: ['var(--serious)', 'var(--serious-soft)', 'var(--serious-text)'],
+    in_progress: ['var(--warn)', 'var(--warn-soft)', 'var(--warn-text)'],
+    done: ['var(--good)', 'var(--good-soft)', 'var(--good-text)'],
+    failed: ['var(--critical)', 'var(--critical-soft)', 'var(--critical-text)'],
+    cancelled: ['var(--neutral)', 'var(--neutral-soft)', 'var(--ink-2)'],
+    unknown: ['var(--neutral)', 'var(--neutral-soft)', 'var(--muted)']
+  };
+  const avatarColors = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'];
+  const elements = {
+    tiles: document.getElementById('tiles'),
+    board: document.getElementById('board'),
+    detail: document.getElementById('task-detail'),
+    labels: document.getElementById('labels-panel'),
+    agents: document.getElementById('agents-panel'),
+    footer: document.getElementById('footer'),
+    refresh: document.getElementById('refresh'),
+    refreshText: document.getElementById('refresh-text'),
+    tokenForm: document.getElementById('token-form'),
+    tokenMessage: document.getElementById('token-message'),
+    tokenInput: document.getElementById('token-input'),
+    requirementFilter: document.getElementById('requires-filter'),
+    agentFilter: document.getElementById('agent-filter')
+  };
+
+  document.getElementById('host').textContent = location.host;
+
+  function node(tag, className, text) {
+    const value = document.createElement(tag);
+    if (className) value.className = className;
+    if (text !== undefined) value.textContent = text;
+    return value;
+  }
+
+  function setColor(element, name, value) {
+    element.style.setProperty(name, value);
+    return element;
+  }
+
+  function normalizedTimestamp(value) {
+    return typeof value === 'string'
+      ? value.replace(/(\.\d{3})\d+(?=Z|[+-]\d{2}:\d{2}$)/, '$1')
+      : '';
+  }
+
+  function timestampMillis(value) {
+    const parsed = Date.parse(normalizedTimestamp(value));
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+
+  function relativeAge(value) {
+    const seconds = Math.max(0, Math.floor((Date.now() - timestampMillis(value)) / 1000));
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
+    if (seconds < 172800) return 'yesterday';
+    return `${Math.floor(seconds / 86400)} days ago`;
+  }
+
+  function absoluteTime(value) {
+    const date = new Date(timestampMillis(value));
+    if (Number.isNaN(date.getTime())) return '—';
+    const year = date.getUTCFullYear();
+    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(date.getUTCDate()).padStart(2, '0');
+    const hour = String(date.getUTCHours()).padStart(2, '0');
+    const minute = String(date.getUTCMinutes()).padStart(2, '0');
+    return `${year}-${month}-${day} ${hour}:${minute} UTC`;
+  }
+
+  function shortId(id) {
+    const hex = String(id).replaceAll('-', '');
+    return `${hex.slice(0, 4)}…${hex.slice(-4)}`;
+  }
+
+  function initials(name) {
+    const parts = String(name).split(/[-_.]+/).filter(Boolean);
+    if (parts.length > 1) return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+    return String(name).slice(0, 2).toUpperCase();
+  }
+
+  function avatarColor(name) {
+    let hash = 0;
+    for (const character of String(name)) hash = ((hash * 31) + character.codePointAt(0)) | 0;
+    return avatarColors[Math.abs(hash) % avatarColors.length];
+  }
+
+  function avatar(name) {
+    return setColor(node('span', 'avatar', initials(name)), 'background', avatarColor(name));
+  }
+
+  function agentChip(name) {
+    const chip = node('span', 'agent');
+    chip.append(avatar(name), document.createTextNode(name));
+    return chip;
+  }
+
+  function priorityBadge(priority) {
+    return node('span', `prio${priority > 0 ? ' high' : ''}`, `P ${priority}`);
+  }
+
+  function taskMap() {
+    return new Map(state.tasks.map(task => [task.id, task]));
+  }
+
+  function visualState(task, tasksById) {
+    if (task.status === 'todo' && task.ready) return 'ready';
+    if (task.status === 'todo') {
+      const blockerStatuses = (task.blocked_by || []).map(id => tasksById.get(id)?.status);
+      if (blockerStatuses.includes('failed')) return 'blocked_failed';
+      if (blockerStatuses.includes('cancelled')) return 'blocked_cancelled';
+      return 'blocked';
+    }
+    return task.status;
+  }
+
+  function statusDescriptor(task, tasksById) {
+    const visual = visualState(task, tasksById);
+    if (visual === 'ready') return {key: 'ready', text: '● Ready'};
+    if (visual === 'blocked_failed') return {key: 'failed', cardKey: 'blocked', text: '⊘ Blocked by failed'};
+    if (visual === 'blocked_cancelled') return {key: 'cancelled', cardKey: 'blocked', text: '⊘ Blocked by cancelled'};
+    if (visual === 'blocked') return {key: 'blocked', text: `⊘ Blocked by ${(task.blocked_by || []).length}`};
+    if (visual === 'in_progress') return {key: 'in_progress', text: '● In progress'};
+    if (visual === 'done') return {key: 'done', text: '✓ Done'};
+    if (visual === 'failed') {
+      const count = (task.dependents || []).length;
+      return {key: 'failed', text: count ? `✕ Failed · blocks ${count}` : '✕ Failed'};
+    }
+    return {key: 'cancelled', text: '– Cancelled'};
+  }
+
+  function pill(descriptor) {
+    const value = node('span', 'pill', descriptor.text);
+    const palette = colors[descriptor.key] || colors.unknown;
+    setColor(value, '--p-bg', palette[1]);
+    setColor(value, '--p-fg', palette[2]);
+    return value;
+  }
+
+  function statusWord(task) {
+    if (!task) return 'unknown';
+    if (task.status === 'todo') return task.ready ? 'ready' : 'blocked';
+    return task.status.replace('_', ' ');
+  }
+
+  function statusColor(task) {
+    if (!task) return colors.unknown[0];
+    const key = task.status === 'todo' ? (task.ready ? 'ready' : 'blocked') : task.status;
+    return (colors[key] || colors.unknown)[0];
+  }
+
+  function compactJson(value) {
+    if (typeof value === 'string') return value;
+    const encoded = JSON.stringify(value);
+    return encoded === undefined ? String(value) : encoded;
+  }
+
+  function preview(value) {
+    const text = compactJson(value);
+    return text.length > 80 ? `${text.slice(0, 79)}…` : text;
+  }
+
+  function isEmptyObject(value) {
+    return value !== null && !Array.isArray(value) && typeof value === 'object' && Object.keys(value).length === 0;
+  }
+
+  function renderFilters() {
+    for (const button of document.querySelectorAll('[data-filter]')) {
+      const active = button.dataset.filter === state.statusFilter;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    }
+
+    const requirementNames = new Set(state.labels.map(label => label.name));
+    for (const task of state.tasks) {
+      for (const requirement of task.requires || []) requirementNames.add(requirement.name);
+    }
+    const agentNames = new Set(state.tasks.map(task => task.claimed_by).filter(Boolean));
+    rebuildSelect(elements.requirementFilter, [...requirementNames].sort((a, b) => a.localeCompare(b)), state.requirementFilter);
+    rebuildSelect(elements.agentFilter, [...agentNames].sort((a, b) => a.localeCompare(b)), state.agentFilter);
+    if (![...requirementNames, 'any'].includes(state.requirementFilter)) state.requirementFilter = 'any';
+    if (![...agentNames, 'any'].includes(state.agentFilter)) state.agentFilter = 'any';
+    elements.requirementFilter.value = state.requirementFilter;
+    elements.agentFilter.value = state.agentFilter;
+  }
+
+  function rebuildSelect(select, values, selected) {
+    const options = [node('option', '', 'any')];
+    options[0].value = 'any';
+    for (const name of values) {
+      const option = node('option', '', name);
+      option.value = name;
+      options.push(option);
+    }
+    select.replaceChildren(...options);
+    select.value = selected;
+  }
+
+  function renderTiles() {
+    const ready = state.tasks.filter(task => task.status === 'todo' && task.ready);
+    const blocked = state.tasks.filter(task => task.status === 'todo' && !task.ready);
+    const inProgress = state.tasks.filter(task => task.status === 'in_progress');
+    const done = state.tasks.filter(task => task.status === 'done');
+    const failed = state.tasks.filter(task => task.status === 'failed');
+    const cancelled = state.tasks.filter(task => task.status === 'cancelled');
+    const upstream = new Set(blocked.flatMap(task => task.blocked_by || [])).size;
+    const activeAgents = new Set(inProgress.map(task => task.claimed_by).filter(Boolean)).size;
+    const recentDone = done.filter(task => Date.now() - timestampMillis(task.updated_at) <= 86400000).length;
+    const blockingFailed = failed.filter(task => (task.dependents || []).length > 0).length;
+    const definitions = [
+      ['Ready', ready.length, 'all dependencies done', 'accent'],
+      ['Blocked', blocked.length, `waiting on ${upstream} upstream ${upstream === 1 ? 'task' : 'tasks'}`, 'serious'],
+      ['In progress', inProgress.length, `${activeAgents} ${activeAgents === 1 ? 'agent' : 'agents'} active`, 'warn'],
+      ['Done', done.length, `${recentDone} in last 24 h`, 'good'],
+      ['Failed', failed.length, blockingFailed === 0 ? 'nothing blocked' : `${blockingFailed} ${blockingFailed === 1 ? 'blocks' : 'block'} other work`, 'critical'],
+      ['Cancelled', cancelled.length, 'retry returns to pool', 'neutral']
+    ];
+    const tiles = definitions.map(([label, value, sub, color]) => {
+      const tile = setColor(node('div', 'tile'), '--tile-color', `var(--${color})`);
+      const labelNode = node('div', 'label');
+      labelNode.append(setColor(node('span', 'dot'), '--c', `var(--${color})`), document.createTextNode(label));
+      tile.append(labelNode, node('div', 'value tabular', value), node('div', 'sub', sub));
+      return tile;
+    });
+    elements.tiles.replaceChildren(...tiles);
+  }
+
+  function filteredTasks() {
+    return state.tasks.filter(task => {
+      const statusMatches = state.statusFilter === 'all'
+        || (state.statusFilter === 'ready' && task.ready === true)
+        || (state.statusFilter === 'blocked' && task.status === 'todo' && !task.ready);
+      const requirementMatches = state.requirementFilter === 'any'
+        || (task.requires || []).some(requirement => requirement.name === state.requirementFilter);
+      const agentMatches = state.agentFilter === 'any' || task.claimed_by === state.agentFilter;
+      return statusMatches && requirementMatches && agentMatches;
+    });
+  }
+
+  function card(task, tasksById) {
+    const descriptor = statusDescriptor(task, tasksById);
+    const cardKey = descriptor.cardKey || descriptor.key;
+    const value = node('button', 'card');
+    value.type = 'button';
+    value.setAttribute('aria-label', `${task.title}, ${descriptor.text.replace(/^[●⊘✓✕–]\s*/, '')}`);
+    setColor(value, '--card-color', colors[cardKey][0]);
+    if (task.status === 'todo' && !task.ready) value.classList.add('blocked');
+    if (task.status === 'done' || task.status === 'cancelled') value.classList.add('dim');
+    if (task.id === state.selectedId) value.classList.add('selected');
+    value.addEventListener('click', () => {
+      state.selectedId = state.selectedId === task.id ? null : task.id;
+      render();
+    });
+
+    const top = node('div', 'row');
+    top.append(priorityBadge(task.priority), node('span', 'title', task.title));
+    value.append(top);
+    if ((task.requires || []).length) {
+      const labels = node('div', 'labels');
+      for (const requirement of task.requires) labels.append(node('span', 'lbl', requirement.name));
+      value.append(labels);
+    }
+    if (task.status === 'failed' && task.result !== null) {
+      const result = node('div', 'result-preview');
+      result.append(document.createTextNode('result: '), node('span', 'mono', preview(task.result)));
+      value.append(result);
+    }
+
+    const footer = node('div', 'foot');
+    if (task.status === 'in_progress') {
+      if (task.claimed_by) footer.append(agentChip(task.claimed_by));
+      footer.append(node('span', 'pulse'));
+      footer.lastElementChild.title = 'active';
+      footer.append(node('span', 'age', `claimed ${relativeAge(task.updated_at)}`));
+    } else if (task.status === 'done') {
+      if (task.claimed_by) footer.append(agentChip(task.claimed_by));
+      footer.append(pill(descriptor), node('span', 'age', relativeAge(task.updated_at)));
+    } else if (task.status === 'failed') {
+      if (task.claimed_by) footer.append(agentChip(task.claimed_by));
+      footer.append(pill(descriptor), node('span', 'age', relativeAge(task.updated_at)));
+    } else if (task.status === 'cancelled') {
+      footer.append(pill(descriptor), node('span', 'age', relativeAge(task.updated_at)));
+    } else {
+      footer.append(pill(descriptor), node('span', 'age', `created ${relativeAge(task.created_at)}`));
+    }
+    const id = node('span', 'mono id', shortId(task.id));
+    id.title = task.id;
+    footer.append(id);
+    value.append(footer);
+    return value;
+  }
+
+  function column(title, tasks, tasksById, options = {}) {
+    const container = node('div', 'col');
+    const head = node('div', 'col-head');
+    head.append(node('h2', '', title), node('span', 'count tabular', tasks.length));
+    if (options.subtitle) head.append(node('span', 'split', options.subtitle));
+    container.append(head);
+    if (!tasks.length) {
+      container.append(node('div', 'col-note', options.empty || 'No tasks here'));
+      return container;
+    }
+    for (const task of tasks) container.append(card(task, tasksById));
+    return container;
+  }
+
+  function renderBoard() {
+    const tasks = filteredTasks();
+    const tasksById = taskMap();
+    const ready = tasks.filter(task => task.status === 'todo' && task.ready);
+    const blocked = tasks.filter(task => task.status === 'todo' && !task.ready);
+    const inProgress = tasks.filter(task => task.status === 'in_progress');
+    const done = tasks.filter(task => task.status === 'done').sort((a, b) => timestampMillis(b.updated_at) - timestampMillis(a.updated_at));
+    const failedAndCancelled = [
+      ...tasks.filter(task => task.status === 'failed'),
+      ...tasks.filter(task => task.status === 'cancelled')
+    ];
+
+    const todo = node('div', 'col');
+    const todoHead = node('div', 'col-head');
+    todoHead.append(
+      node('h2', '', 'To do'),
+      node('span', 'count tabular', ready.length + blocked.length),
+      node('span', 'split', `${ready.length} ready · ${blocked.length} blocked`)
+    );
+    todo.append(todoHead);
+    if (!ready.length && !blocked.length) {
+      todo.append(node('div', 'col-note', 'Nothing to do'));
+    } else {
+      for (const task of ready) todo.append(card(task, tasksById));
+      if (blocked.length) {
+        todo.append(node('hr', 'divider'));
+        const subhead = node('div', 'subhead');
+        subhead.append(setColor(node('span', 'dot'), '--c', 'var(--serious)'), document.createTextNode('Blocked'));
+        todo.append(subhead);
+        for (const task of blocked) todo.append(card(task, tasksById));
+      }
+    }
+
+    const doneVisible = state.showAllDone ? done : done.slice(0, 30);
+    const doneColumn = column('Done', doneVisible, tasksById, {subtitle: 'newest first', empty: 'Nothing completed yet'});
+    doneColumn.querySelector('.count').textContent = done.length;
+    if (done.length > 30) {
+      const toggle = node('button', 'col-note', state.showAllDone ? 'show fewer' : `+ ${done.length - 30} older · show all`);
+      toggle.type = 'button';
+      toggle.addEventListener('click', () => {
+        state.showAllDone = !state.showAllDone;
+        render();
+      });
+      doneColumn.append(toggle);
+    }
+
+    elements.board.replaceChildren(
+      todo,
+      column('In progress', inProgress, tasksById, {empty: 'No work in progress'}),
+      doneColumn,
+      column('Failed · Cancelled', failedAndCancelled, tasksById, {empty: 'No failed or cancelled tasks'})
+    );
+  }
+
+  function appendKeyValue(list, key, value, className) {
+    list.append(node('dt', '', key), node('dd', className || '', value));
+  }
+
+  function dependencySection(container, heading, ids, tasksById, doneCount) {
+    const suffix = doneCount === undefined ? ids.length : doneCount;
+    container.append(node('div', 'section-label', `${heading} · ${suffix}${doneCount === undefined ? '' : ' done'}`));
+    if (!ids.length) {
+      container.append(node('div', 'empty', 'None'));
+      return;
+    }
+    for (const id of ids) {
+      const related = tasksById.get(id);
+      const row = node(related ? 'button' : 'div', 'dep');
+      if (related) {
+        row.type = 'button';
+        row.addEventListener('click', () => {
+          state.selectedId = related.id;
+          render();
+        });
+      }
+      const title = related ? related.title : shortId(id);
+      row.append(
+        setColor(node('span', 'dot'), '--c', statusColor(related)),
+        node('span', 't', title),
+        node('span', 'mono muted', statusWord(related))
+      );
+      container.append(row);
+    }
+  }
+
+  function renderDetail() {
+    const tasksById = taskMap();
+    const task = state.selectedId ? tasksById.get(state.selectedId) : null;
+    if (!task) {
+      elements.detail.replaceChildren(node('div', 'empty', 'Select a card to see its details.'));
+      return;
+    }
+    const content = [];
+    content.push(node('div', 'detail-title', task.title));
+    const badges = node('div', 'detail-badges');
+    badges.append(pill(statusDescriptor(task, tasksById)), priorityBadge(task.priority), node('span', 'mono muted', `v${task.version}`));
+    content.push(badges);
+    content.push(node('div', task.description ? 'desc' : 'desc muted', task.description || 'No description'));
+    const list = node('dl', 'kv');
+    appendKeyValue(list, 'id', task.id, 'mono');
+    appendKeyValue(list, 'status', task.status);
+    appendKeyValue(list, 'claimed_by', task.claimed_by || '—', task.claimed_by ? '' : 'muted');
+    appendKeyValue(list, 'created', absoluteTime(task.created_at), 'tabular');
+    appendKeyValue(list, 'updated', absoluteTime(task.updated_at), 'tabular');
+    content.push(list, node('div', 'section-label', 'Requires'));
+    if ((task.requires || []).length) {
+      for (const requirement of task.requires) {
+        const row = node('div', 'lab-row');
+        const copy = node('div');
+        copy.append(
+          node('div', 'name', requirement.name),
+          node('div', requirement.description ? 'd' : 'd muted', requirement.description || 'No description')
+        );
+        row.append(copy);
+        content.push(row);
+      }
+    } else {
+      content.push(node('div', 'empty', 'No requirements.'));
+    }
+
+    const fragment = document.createDocumentFragment();
+    fragment.append(...content);
+    const dependencies = task.depends_on || [];
+    const doneCount = dependencies.filter(id => tasksById.get(id)?.status === 'done').length;
+    dependencySection(fragment, 'Depends on', dependencies, tasksById, doneCount);
+    dependencySection(fragment, 'Dependents', task.dependents || [], tasksById);
+    if (!isEmptyObject(task.metadata)) {
+      fragment.append(node('div', 'section-label', 'Metadata'), node('pre', 'json', JSON.stringify(task.metadata, null, 2)));
+    }
+    if (task.result !== null) {
+      fragment.append(node('div', 'section-label', 'Result'), node('pre', 'json', JSON.stringify(task.result, null, 2)));
+    }
+    elements.detail.replaceChildren(fragment);
+  }
+
+  function renderLabels() {
+    if (!state.labels.length) {
+      elements.labels.replaceChildren(node('div', 'empty', 'No open tasks carry labels.'));
+      return;
+    }
+    const rows = state.labels.map(label => {
+      const row = node('div', 'lab-row');
+      const copy = node('div');
+      copy.append(
+        node('div', 'name', label.name),
+        node('div', label.description ? 'd' : 'd missing', label.description || 'No description yet.')
+      );
+      const count = node('span', 'n tabular', label.open_tasks);
+      count.title = `${label.open_tasks} open · ${label.ready_tasks} ready`;
+      row.append(copy, count);
+      return row;
+    });
+    elements.labels.replaceChildren(...rows);
+  }
+
+  function renderAgents() {
+    const grouped = new Map();
+    for (const task of state.tasks.filter(task => task.status === 'in_progress' && task.claimed_by)) {
+      if (!grouped.has(task.claimed_by)) grouped.set(task.claimed_by, []);
+      grouped.get(task.claimed_by).push(task);
+    }
+    if (!grouped.size) {
+      elements.agents.replaceChildren(node('div', 'empty', 'No agents working right now.'));
+      return;
+    }
+    const rows = [];
+    for (const [name, held] of grouped) {
+      held.sort((a, b) => b.priority - a.priority || timestampMillis(a.created_at) - timestampMillis(b.created_at));
+      const current = held[0];
+      const row = node('div', 'agent-row');
+      const copy = node('div', 'agent-copy');
+      copy.append(node('div', 'who', name), node('div', 'what', `${current.title}${held.length > 1 ? ` · +${held.length - 1} more` : ''}`));
+      row.append(avatar(name), copy, node('span', 'r', relativeAge(current.updated_at)));
+      rows.push(row);
+    }
+    elements.agents.replaceChildren(...rows);
+  }
+
+  function renderFooter() {
+    const version = state.version ? `orcis ${state.version} · ` : '';
+    elements.footer.textContent = `${version}${state.tasks.length} tasks · polling GET /tasks every 5 s`;
+  }
+
+  function render() {
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+    renderFilters();
+    renderTiles();
+    renderBoard();
+    renderDetail();
+    renderLabels();
+    renderAgents();
+    renderFooter();
+    window.scrollTo(scrollX, scrollY);
+  }
+
+  function headers() {
+    return state.token ? {Authorization: `Bearer ${state.token}`} : {};
+  }
+
+  async function requestJson(url) {
+    let response;
+    try {
+      response = await fetch(url, {headers: headers()});
+    } catch (cause) {
+      throw {kind: 'network', cause};
+    }
+    if (response.status === 401) throw {kind: 'unauthorized'};
+    if (!response.ok) throw {kind: 'http', status: response.status};
+    try {
+      return await response.json();
+    } catch (cause) {
+      throw {kind: 'network', cause};
+    }
+  }
+
+  function showTokenPrompt(rejected) {
+    stopPolling();
+    state.connected = false;
+    elements.tokenMessage.textContent = rejected ? 'Token rejected' : 'This board needs a token';
+    elements.tokenForm.classList.add('visible');
+    elements.tokenInput.value = '';
+    elements.tokenInput.focus();
+    elements.refresh.className = 'refresh disconnected';
+    elements.refreshText.textContent = 'Waiting for token';
+  }
+
+  function setDisconnected() {
+    state.connected = false;
+    elements.refresh.className = 'refresh disconnected';
+    elements.refreshText.textContent = 'Disconnected · retrying';
+  }
+
+  function updateRefreshText() {
+    if (!state.connected || state.lastRefresh === null) return;
+    const seconds = Math.max(0, Math.floor((Date.now() - state.lastRefresh) / 1000));
+    elements.refresh.className = 'refresh';
+    elements.refreshText.textContent = seconds === 0
+      ? 'Live · refreshed just now'
+      : `Live · refreshed ${seconds} s ago`;
+  }
+
+  async function loadVersion() {
+    try {
+      const index = await requestJson('.');
+      if (typeof index.version === 'string') {
+        state.version = index.version;
+        renderFooter();
+      }
+    } catch (error) {
+      if (error.kind === 'unauthorized') showTokenPrompt(Boolean(state.token));
+    }
+  }
+
+  async function poll() {
+    if (state.loading) return;
+    state.loading = true;
+    try {
+      const tasksRequest = requestJson('tasks').then(taskEnvelope => {
+        if (!state.indexAttempted) {
+          state.indexAttempted = true;
+          loadVersion();
+        }
+        return taskEnvelope;
+      });
+      const [taskEnvelope, labelEnvelope] = await Promise.all([tasksRequest, requestJson('labels')]);
+      state.tasks = Array.isArray(taskEnvelope.tasks) ? taskEnvelope.tasks : [];
+      state.labels = Array.isArray(labelEnvelope.labels) ? labelEnvelope.labels : [];
+      if (state.selectedId && !state.tasks.some(task => task.id === state.selectedId)) state.selectedId = null;
+      state.connected = true;
+      state.lastRefresh = Date.now();
+      elements.tokenForm.classList.remove('visible');
+      render();
+      updateRefreshText();
+    } catch (error) {
+      if (error.kind === 'unauthorized') showTokenPrompt(Boolean(state.token));
+      else setDisconnected();
+    } finally {
+      state.loading = false;
+    }
+  }
+
+  function stopPolling() {
+    if (state.pollTimer !== null) window.clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+
+  function startPolling() {
+    stopPolling();
+    poll();
+    state.pollTimer = window.setInterval(poll, 5000);
+  }
+
+  for (const button of document.querySelectorAll('[data-filter]')) {
+    button.addEventListener('click', () => {
+      state.statusFilter = button.dataset.filter;
+      render();
+    });
+  }
+  elements.requirementFilter.addEventListener('change', () => {
+    state.requirementFilter = elements.requirementFilter.value;
+    render();
+  });
+  elements.agentFilter.addEventListener('change', () => {
+    state.agentFilter = elements.agentFilter.value;
+    render();
+  });
+  elements.tokenForm.addEventListener('submit', event => {
+    event.preventDefault();
+    state.token = elements.tokenInput.value;
+    sessionStorage.setItem('orcis.token', state.token);
+    elements.tokenForm.classList.remove('visible');
+    elements.refresh.className = 'refresh connecting';
+    elements.refreshText.textContent = 'Connecting…';
+    state.indexAttempted = false;
+    startPolling();
+  });
+
+  render();
+  startPolling();
+  window.setInterval(updateRefreshText, 1000);
+})();
+</script>
+</body>
+</html>

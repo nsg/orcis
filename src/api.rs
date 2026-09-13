@@ -25,6 +25,7 @@ use crate::{
 };
 
 const AGENT_DOCS: &str = include_str!("../docs/agent.md");
+const BOARD_UI: &str = include_str!("ui/index.html");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -184,6 +185,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/healthz", get(health))
         .route("/docs.md", get(agent_docs))
+        .route("/ui", get(board_ui))
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/claim", post(claim_next))
         .route(
@@ -209,7 +211,9 @@ async fn authorize(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if request.method() == Method::GET && matches!(request.uri().path(), "/healthz" | "/docs.md") {
+    if request.method() == Method::GET
+        && matches!(request.uri().path(), "/healthz" | "/docs.md" | "/ui")
+    {
         return Ok(next.run(request).await);
     }
     let Some(expected) = &state.expected_authorization else {
@@ -241,6 +245,7 @@ async fn index() -> AxumJson<Index> {
                 "/docs.md",
                 "Read the agent documentation as Markdown.",
             ),
+            endpoint("GET", "/ui", "View the board read-only in a browser."),
             endpoint("POST", "/tasks", "Create a task."),
             endpoint("GET", "/tasks", "List and filter tasks."),
             endpoint("GET", "/tasks/{id}", "Get a task."),
@@ -291,6 +296,16 @@ async fn agent_docs() -> impl IntoResponse {
     (
         [("content-type", "text/markdown; charset=utf-8")],
         AGENT_DOCS,
+    )
+}
+
+async fn board_ui() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
+        BOARD_UI,
     )
 }
 

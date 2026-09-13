@@ -128,6 +128,48 @@ async fn agent_docs_are_public_markdown_and_cover_the_index() {
 }
 
 #[tokio::test]
+async fn board_ui_is_public_html() {
+    let unprotected = app(None);
+    let response = unprotected.clone().oneshot(get("/ui")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let body = body_text(response).await;
+    assert!(body.to_ascii_lowercase().starts_with("<!doctype html>"));
+    assert!(body.contains("orcis"));
+
+    let response = unprotected
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let protected = app(Some("secret"));
+    let response = protected.clone().oneshot(get("/ui")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = protected
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await, json!({"error": "unauthorized"}));
+}
+
+#[tokio::test]
 async fn task_crud_filters_and_json_errors() {
     let app = app(None);
     let first = create_task(
@@ -575,7 +617,7 @@ async fn dependency_chain_blocks_then_unlocks() {
 }
 
 #[tokio::test]
-async fn auth_exempts_health_and_agent_docs_only() {
+async fn auth_exempts_health_docs_and_ui_only() {
     let app = app(Some("secret"));
     let response = app.clone().oneshot(get("/tasks")).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -590,6 +632,9 @@ async fn auth_exempts_health_and_agent_docs_only() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     let response = app.clone().oneshot(get("/healthz")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app.clone().oneshot(get("/ui")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let response = app
