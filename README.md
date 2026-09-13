@@ -27,15 +27,9 @@ Run it as a single static binary configured through environment variables, and o
 
 Each task follows this lifecycle:
 
-```text
-todo --------claim--------> in_progress --------complete--------> done
-todo <------release-------- in_progress --------fail------------> failed
-todo --------cancel---------------------------------------------> cancelled
-in_progress -cancel---------------------------------------------> cancelled
-failed ------cancel---------------------------------------------> cancelled
-failed ------retry--------> todo
-cancelled ---retry--------> todo
-```
+<p align="center">
+  <img src="docs/lifecycle.svg" alt="Task lifecycle: todo moves to in_progress on claim and back on release; in_progress moves to done on complete or failed on fail; todo, in_progress and failed move to cancelled on cancel; failed and cancelled move back to todo on retry." width="720">
+</p>
 
 A task is `ready` exactly when its status is `todo` and every task in `depends_on` is `done`. A `failed` or `cancelled` dependency keeps its dependents blocked until that dependency is retried and completed or the dependency edge is removed.
 

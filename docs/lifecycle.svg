@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 400" width="720" height="400" role="img" aria-labelledby="title desc">
+  <title id="title">Task lifecycle</title>
+  <desc id="desc">todo moves to in_progress on claim and back on release. in_progress moves to done on complete or to failed on fail. todo, in_progress and failed move to cancelled on cancel. failed and cancelled move back to todo on retry.</desc>
+  <style>
+    .edge { fill: none; stroke: #6e7781; stroke-width: 1.6; }
+    .arrowhead { fill: #6e7781; }
+    .junction { fill: #6e7781; }
+    .label { font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #57606a; }
+    .note { font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #57606a; }
+    .node-text { font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #ffffff; }
+    .todo { fill: #2563eb; }
+    .in_progress { fill: #b45309; }
+    .done { fill: #047857; }
+    .failed { fill: #dc2626; }
+    .cancelled { fill: #57534e; }
+    @media (prefers-color-scheme: dark) {
+      .edge { stroke: #8b949e; }
+      .arrowhead, .junction { fill: #8b949e; }
+      .label, .note { fill: #8b949e; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" class="arrowhead"/>
+    </marker>
+  </defs>
+
+  <!-- edges -->
+  <path class="edge" d="M175,50 H283" marker-end="url(#arrow)"/>
+  <text class="label" x="230" y="42" text-anchor="middle">claim</text>
+  <path class="edge" d="M285,70 H177" marker-end="url(#arrow)"/>
+  <text class="label" x="230" y="86" text-anchor="middle">release</text>
+
+  <path class="edge" d="M415,52 H523" marker-end="url(#arrow)"/>
+  <text class="label" x="470" y="44" text-anchor="middle">complete</text>
+
+  <path class="edge" d="M350,82 V166" marker-end="url(#arrow)"/>
+  <text class="label" x="358" y="129">fail</text>
+
+  <path class="edge" d="M350,212 V296" marker-end="url(#arrow)"/>
+  <text class="label" x="358" y="259">cancel</text>
+
+  <path class="edge" d="M415,72 H450 V320 H417" marker-end="url(#arrow)"/>
+  <text class="label" x="458" y="200">cancel</text>
+
+  <path class="edge" d="M90,82 V330 H283" marker-end="url(#arrow)"/>
+  <text class="label" x="82" y="210" text-anchor="end">cancel</text>
+
+  <path class="edge" d="M285,310 H150 V84" marker-end="url(#arrow)"/>
+  <path class="edge" d="M285,190 H150"/>
+  <circle class="junction" cx="150" cy="190" r="2.5"/>
+  <text class="label" x="218" y="182" text-anchor="middle">retry</text>
+  <text class="label" x="218" y="302" text-anchor="middle">retry</text>
+
+  <!-- nodes -->
+  <rect class="todo" x="45" y="38" width="130" height="44" rx="8"/>
+  <text class="node-text" x="110" y="60" dy="0.35em" text-anchor="middle">todo</text>
+
+  <rect class="in_progress" x="285" y="38" width="130" height="44" rx="8"/>
+  <text class="node-text" x="350" y="60" dy="0.35em" text-anchor="middle">in_progress</text>
+
+  <rect class="done" x="525" y="38" width="130" height="44" rx="8"/>
+  <text class="node-text" x="590" y="60" dy="0.35em" text-anchor="middle">done</text>
+
+  <rect class="failed" x="285" y="168" width="130" height="44" rx="8"/>
+  <text class="node-text" x="350" y="190" dy="0.35em" text-anchor="middle">failed</text>
+
+  <rect class="cancelled" x="285" y="298" width="130" height="44" rx="8"/>
+  <text class="node-text" x="350" y="320" dy="0.35em" text-anchor="middle">cancelled</text>
+
+  <text class="note" x="45" y="384">claim needs a ready task: status todo and every dependency done.</text>
+</svg>
