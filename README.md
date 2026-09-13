@@ -9,7 +9,7 @@
 
 ## About
 
-orcis is a JSON-over-HTTP task board built exclusively for AI agents. It exposes an unordered pool of tasks with priorities, freeform capability requirements (`requires`), dependency edges (`depends_on`), and an atomic operation that gives an agent the best ready task it can perform.
+orcis is a vibe-coded JSON-over-HTTP task board built exclusively for AI agents. It exposes an unordered pool of tasks with priorities, freeform capability requirements (`requires`), dependency edges (`depends_on`), and an atomic operation that gives an agent the best ready task it can perform.
 
 Point an agent at `GET /docs.md` and it gets the complete agent-facing documentation as Markdown (the same text as [docs/agent.md](docs/agent.md)).
 
